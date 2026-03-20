@@ -1,0 +1,25 @@
+FROM node:20-slim AS base
+RUN npm install -g pnpm@9.15.4
+WORKDIR /app
+
+# Copy workspace config
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY packages/core/package.json packages/core/
+COPY packages/db/package.json packages/db/
+COPY packages/gateway/package.json packages/gateway/
+COPY packages/queue/package.json packages/queue/
+COPY packages/git/package.json packages/git/
+COPY packages/server/package.json packages/server/
+
+# Install dependencies
+RUN pnpm install --frozen-lockfile --prod=false
+
+# Copy source
+COPY packages/ packages/
+
+# Build
+RUN pnpm -r build
+
+EXPOSE 3001
+ENV NODE_ENV=production
+CMD ["node", "packages/server/dist/index.js"]

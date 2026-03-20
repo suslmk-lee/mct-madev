@@ -1,0 +1,100 @@
+version: "1.0"
+name: "Default Development Workflow"
+description: "Standard multi-agent development pipeline with PM, developer, and reviewer"
+
+agents:
+  - id: pm
+    role: PM
+    provider: anthropic
+    model: claude-sonnet-4-5
+    systemPrompt: |
+      You are a project manager. Analyze requirements, break them into tasks,
+      assign to developers, and coordinate the development process.
+
+  - id: backend_dev
+    role: DEVELOPER
+    provider: anthropic
+    model: claude-sonnet-4-5
+    systemPrompt: |
+      You are a backend developer. Implement server-side features,
+      APIs, and database logic. Write clean, tested code.
+
+  - id: frontend_dev
+    role: DEVELOPER
+    provider: anthropic
+    model: claude-sonnet-4-5
+    systemPrompt: |
+      You are a frontend developer. Implement UI components,
+      state management, and user interactions. Focus on UX.
+
+  - id: reviewer
+    role: REVIEWER
+    provider: anthropic
+    model: claude-sonnet-4-5
+    systemPrompt: |
+      You are a code reviewer. Review pull requests for correctness,
+      performance, security, and code quality. Provide actionable feedback.
+
+  - id: tester
+    role: TESTER
+    provider: anthropic
+    model: claude-sonnet-4-5
+    systemPrompt: |
+      You are a QA engineer. Write and run tests, identify edge cases,
+      and verify that implementations meet requirements.
+
+stages:
+  - id: planning
+    agent: pm
+    prompt: |
+      Analyze the following task and create a detailed implementation plan.
+      Break it into subtasks with clear dependencies.
+      Output a structured plan with subtask descriptions.
+    outputs: [plan, subtasks]
+
+  - id: backend_impl
+    dependsOn: [planning]
+    agent: backend_dev
+    prompt: |
+      Implement the backend portion of the plan.
+      Follow the subtasks assigned to you.
+      Write production-ready code with error handling.
+    outputs: [code, tests]
+    timeout: 300000
+
+  - id: frontend_impl
+    dependsOn: [planning]
+    agent: frontend_dev
+    prompt: |
+      Implement the frontend portion of the plan.
+      Follow the subtasks assigned to you.
+      Create responsive, accessible UI components.
+    outputs: [code, tests]
+    timeout: 300000
+
+  - id: testing
+    dependsOn: [backend_impl, frontend_impl]
+    agent: tester
+    prompt: |
+      Review and test the implementations.
+      Run all tests, check edge cases, verify integration.
+      Report any issues found.
+    outputs: [test_results, issues]
+
+  - id: code_review
+    dependsOn: [testing]
+    agent: reviewer
+    prompt: |
+      Review all code changes.
+      Check for correctness, performance, security issues.
+      Approve or request changes with specific feedback.
+    outputs: [review_result, comments]
+
+  - id: merge
+    dependsOn: [code_review]
+    agent: pm
+    prompt: |
+      Review the code review results.
+      If approved, merge the changes.
+      Generate a summary report of what was accomplished.
+    outputs: [summary, merge_status]

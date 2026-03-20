@@ -1,0 +1,868 @@
+================================================================================
+MCT-MADEV: Multi-Agent Orchestration System with 3D Office UI
+초기 프롬프트 (Initial Reproduction Prompt)
+================================================================================
+
+이 문서는 MCT-MADEV 프로젝트를 다른 환경에서 동일하게 재현하기 위한
+완전한 프롬프트입니다. AI 어시스턴트에게 이 문서를 제공하면 전체 시스템을
+처음부터 구축할 수 있습니다.
+
+================================================================================
+1. 프로젝트 개요
+================================================================================
+
+MCT-MADEV는 LLM 기반 멀티 에이전트가 가상 3D 오피스에서 협업하는
+오케스트레이션 시스템입니다.
+
+핵심 기능:
+- CEO(사용자)가 채팅으로 지시 → PM 에이전트가 작업 분해 → 팀원 에이전트가 실행
+- 3D 오피스 UI에서 에이전트가 걸어다니고, 상태 변화를 시각적으로 표현
+- 실시간 WebSocket 기반 상태 동기화
+- 7개 LLM 프로바이더 지원 (Anthropic, OpenAI, Google, Ollama, Kimi, MiniMax, GLM)
+- CLI로 서버 시작, 에이전트/스킬 관리
+
+기술 스택:
+- TypeScript (strict, ESM only)
+- PNPM monorepo (packages/* + apps/*)
+- Express + WebSocket (서버)
+- React 19 + Three.js (React Three Fiber) + Zustand (프론트)
+- sql.js (인메모리 SQLite)
+- Biome (린트/포맷)
+- tsup (번들링)
+- Vite + Tailwind CSS v4 (웹 빌드)
+
+================================================================================
+2. 모노레포 구조
+================================================================================
+
+mct-madev/
+├── package.json              # 루트 (workspaces, 공통 scripts)
+├── pnpm-workspace.yaml       # packages/*, apps/*
+├── tsconfig.json             # 루트 TS 설정 (strict, ES2022, ESM)
+├── biome.json                # single-quote, trailing commas, 100-char
+├── .env.example              # API 키 템플릿
+├── docker-compose.yml        # server + web + PostgreSQL + Redis
+├── docker/
+│   ├── Dockerfile.server
+│   ├── Dockerfile.web
+│   └── nginx.conf
+│
+├── packages/
+│   ├── core/                 # 타입, TaskStateMachine, DAG, Orchestrator, PMAgent, Skills
+│   ├── gateway/              # 멀티모델 LLM 게이트웨이
+│   ├── db/                   # SQLite (sql.js) 데이터베이스
+│   ├── queue/                # better-queue 어댑터
+│   ├── git/                  # Git worktree 매니저
+│   ├── server/               # Express API + WebSocket
+│   └── cli/                  # CLI (mct-madev start/agent/skill)
+│
+└── apps/
+    └── web/                  # React Three Fiber 3D 오피스 UI
+
+================================================================================
+3. packages/core — 타입, 오케스트레이션, 스킬
+================================================================================
+
+3.1 타입 정의 (src/types/)
+─────────────────────────
+
+■ Agent (agent.ts)
+  - AgentRole: PM | DEVELOPER | REVIEWER | TESTER | DEVOPS
+  - AgentVisualState: IDLE | WORKING | COFFEE | READING | WALKING
+                      | CHATTING | NAPPING | GAMING | THINKING
+  - IDLE_BEHAVIOR_WEIGHTS: 가중치 기반 랜덤 idle 행동 선택
+    { COFFEE:14, READING:14, CHATTING:10, THINKING:10, GAMING:8, NAPPING:6, WALKING:38 }
+  - Agent 인터페이스:
+    id, projectId, name, role, provider, model, systemPrompt?,
+    visualState, position:{x,y,z}, currentTaskId?, metadata, createdAt, updatedAt
+  - pickIdleBehavior(): 가중치 기반 랜덤 선택 함수
+
+■ Task (task.ts)
+  - TaskStatus: CREATED | PLANNING | REVIEWING | APPROVED | IN_PROGRESS
+               | CODE_REVIEW | MERGING | DONE | REJECTED | BLOCKED | FAILED
+  - TASK_TRANSITIONS: 상태별 허용 전이 맵
+    예: CREATED → [PLANNING, REJECTED], IN_PROGRESS → [CODE_REVIEW, FAILED, BLOCKED]
+  - TaskStateMachine: canTransition(), transition(), getAvailableTransitions()
+  - Task 인터페이스:
+    id, projectId, workflowId?, parentTaskId?, title, description, status,
+    assigneeAgentId?, priority, dependencies:string[], metadata, result?, error?,
+    createdAt, updatedAt
+
+■ Project (project.ts)
+  - Project: id, name, description?, repoPath?, config, createdAt, updatedAt
+  - ProjectConfig: defaultProvider, defaultModel, workflowsDir?, gitEnabled,
+                   maxConcurrentTasks
+
+■ Workflow (workflow.ts)
+  - WorkflowDefinition: version, name, description, agents[], stages[]
+  - WorkflowAgentDef: id, role, provider, model, systemPrompt
+  - WorkflowStage: id, agent, prompt, dependsOn[], outputs[], timeout, retries
+  - Workflow: id, projectId, name, definition, status(PENDING|RUNNING|COMPLETED|
+             FAILED|CANCELLED), currentStageId?, results, createdAt, updatedAt
+
+■ Model (model.ts)
+  - ModelProvider: anthropic | openai | google | ollama | kimi | minimax | glm
+  - ModelConfig: provider, model, apiKey?, baseUrl?, maxTokens?, temperature?
+  - ChatMessage: role(system|user|assistant), content
+  - ChatResponse: content, model, provider, usage{input,output,total}, finishReason
+
+■ Events (events.ts)
+  - EventType: AGENT_STATE_CHANGED | TASK_STATUS_CHANGED | WORKFLOW_STATUS_CHANGED
+               | PM_REPORT_READY | MESSAGE_CREATED | TOKEN_USAGE_UPDATED | LOG_ENTRY
+  - SystemEvent<T>: type, timestamp, payload:T
+  - AgentStatePayload: agentId, previousState, newState, position?
+  - TaskStatusPayload: taskId, previousStatus, newStatus, agentId?
+
+3.2 오케스트레이터 (src/orchestrator/)
+──────────────────────────────────────
+
+■ Orchestrator.ts (443줄)
+  - OrchestratorDeps: DB 추상화 인터페이스 (createTask, getTask, updateTask 등)
+  - GatewayChatFn: (messages, config, options?) => Promise<ChatResponse>
+  - startWorkflow(projectId, workflowDef):
+    → 워크플로우 생성 → 에이전트 인스턴스화(auto-position) → 태스크 생성 → DAG 연결
+  - processNextTasks(projectId):
+    → DAG에서 ready 태스크 가져오기 → 상태 전이 (CREATED→...→DONE) → LLM 호출
+  - executeTask(task, dag): 전체 라이프사이클 관리 + 에이전트 상태 업데이트
+
+■ TaskDAG.ts (158줄)
+  - addTask(task): 노드 추가 + 의존성 자동 등록
+  - getReadyTasks(): 의존성 모두 DONE인 태스크 반환
+  - isComplete(): 모든 태스크 DONE 여부
+  - hasCycle(): DFS 컬러링 알고리즘 순환 감지
+  - getTopologicalOrder(): Kahn's 알고리즘
+
+■ PMAgent.ts (180줄)
+  - decompose(task, chatFn, agents?):
+    → LLM에 JSON 배열 형태의 서브태스크 분해 요청
+    → agents 제공 시 팀 멤버 목록을 시스템 프롬프트에 포함
+    → SubtaskDef: { title, description, assignee?, dependencies[], priority, metadata }
+  - review(task, result, chatFn): 결과 리뷰 → { approved, feedback }
+  - report(projectStatus): 마크다운 상태 보고서 생성
+
+■ WorkflowParser.ts (178줄)
+  - parse(yamlString): YAML → WorkflowDefinition
+  - validate(definition): 필수 필드, 참조, 순환 의존성 검증
+
+3.3 스킬 시스템 (src/skills/)
+─────────────────────────────
+
+■ SkillLoader.ts (150줄)
+  - SkillDefinition: name, description, input_schema(JSON Schema), roles?, keywords?,
+                     handler(llm|script|api), handler_config?
+  - init(): .madev/agents/skills/ 디렉토리 + madev.md 가이드라인 생성
+  - loadSkills(): skills/ 디렉토리의 모든 JSON 파일 로드
+  - selectSkills(allSkills, agentRole, taskDescription): 역할+키워드 기반 필터링
+  - loadGuidelines(): .madev/madev.md 읽기
+  - ToolUseBlock, ToolResultBlock: 도구 호출/결과 인터페이스
+  - ExtendedChatMessage/Response: 도구 사용 확장 메시지
+
+3.4 유틸 (src/utils/)
+─────────────────────
+
+■ positions.ts (57줄)
+  - ROLE_POSITIONS: 역할별 미리 정의된 3D 위치 슬롯
+    PM:        [0,0,-6], [2,0,-6]
+    DEVELOPER: [-3,0,1], [0,0,2], [-3,0,4], [0,0,5]
+    REVIEWER:  [5,0,-2], [7,0,-2]
+    TESTER:    [5,0,2], [7,0,2]
+    DEVOPS:    [-5,0,6], [-7,0,6]
+  - assignPosition(role, existingAgents): 미사용 슬롯 반환, 초과 시 오프셋
+
+================================================================================
+4. packages/gateway — 멀티모델 LLM 게이트웨이
+================================================================================
+
+■ ModelGateway (gateway.ts, 36줄)
+  - registerProvider(provider): 이름으로 프로바이더 등록
+  - chat(messages, config, options?): 프로바이더로 라우팅
+  - isHealthy(name) / listProviders()
+
+■ IProvider 인터페이스 (types.ts)
+  - name, provider 속성
+  - chat(messages, config, options?) → ChatResponse | ExtendedChatResponse
+  - isHealthy() → boolean
+
+■ 프로바이더 구현:
+  - AnthropicProvider (158줄): Claude API v1/messages, 네이티브 tool_use 지원
+  - OpenAIProvider (156줄): v1/chat/completions, function calling → ToolUseBlock 변환
+  - GoogleProvider (129줄): Gemini v1beta, functionDeclarations
+  - OllamaProvider (119줄): 로컬 localhost:11434, OpenAI 호환 포맷
+  - OpenAICompatibleProvider (114줄): 추상 베이스 클래스
+  - KimiProvider (13줄): Moonshot API (extends OpenAICompatible)
+  - MiniMaxProvider (17줄): MiniMax API (커스텀 엔드포인트)
+  - GLMProvider (17줄): Zhipu GLM API (커스텀 엔드포인트)
+
+================================================================================
+5. packages/db — SQLite 데이터베이스
+================================================================================
+
+■ IDatabase 인터페이스 (types.ts):
+  Projects, Agents, Tasks, Workflows, Messages, Logs, TokenUsage CRUD
+
+■ SqliteDatabase (sqlite/SqliteDatabase.ts):
+  - sql.js 사용 (인메모리 + 디스크 영속화)
+  - PRAGMA foreign_keys = ON
+  - 7개 테이블 스키마:
+
+  CREATE TABLE projects (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+    repo_path TEXT, config TEXT DEFAULT '{}',
+    created_at TEXT, updated_at TEXT
+  );
+
+  CREATE TABLE agents (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, role TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+    system_prompt TEXT, visual_state TEXT DEFAULT 'IDLE',
+    position TEXT DEFAULT '{"x":0,"y":0,"z":0}',
+    current_task_id TEXT, metadata TEXT DEFAULT '{}',
+    created_at TEXT, updated_at TEXT
+  );
+
+  CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    workflow_id TEXT REFERENCES workflows(id),
+    parent_task_id TEXT REFERENCES tasks(id),
+    title TEXT NOT NULL, description TEXT DEFAULT '', status TEXT DEFAULT 'CREATED',
+    assignee_agent_id TEXT REFERENCES agents(id),
+    priority INTEGER DEFAULT 0, dependencies TEXT DEFAULT '[]',
+    metadata TEXT DEFAULT '{}', result TEXT, error TEXT,
+    created_at TEXT, updated_at TEXT
+  );
+
+  CREATE TABLE workflows (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, definition TEXT NOT NULL,
+    status TEXT DEFAULT 'PENDING', current_stage_id TEXT,
+    results TEXT DEFAULT '{}', created_at TEXT, updated_at TEXT
+  );
+
+  CREATE TABLE messages (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    role TEXT NOT NULL, content TEXT NOT NULL, token_count INTEGER,
+    created_at TEXT
+  );
+
+  CREATE TABLE token_usage (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    provider TEXT NOT NULL, model TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+    created_at TEXT
+  );
+
+  CREATE TABLE logs (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    level TEXT NOT NULL, source TEXT, message TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}', created_at TEXT
+  );
+
+  ** 중요: deleteAgent() 시 FK 참조 먼저 정리:
+     DELETE FROM token_usage WHERE agent_id = ?
+     DELETE FROM messages WHERE agent_id = ?
+     UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?
+     DELETE FROM agents WHERE id = ?
+
+================================================================================
+6. packages/queue — 큐 어댑터
+================================================================================
+
+■ IQueue<T>: enqueue, onProcess, onComplete, onFailed, pause, resume, close, getStats
+■ BetterQueueAdapter<T>: better-queue 래핑, concurrency/retry 지원
+
+================================================================================
+7. packages/git — Git Worktree 매니저
+================================================================================
+
+■ WorktreeManager(repoPath):
+  - isGitRepo() → boolean
+  - createWorktree(branch, agentId, taskId) → WorktreeInfo
+  - removeWorktree(path)
+  - listWorktrees() → WorktreeInfo[]
+  - mergeWorktree(path, targetBranch)
+
+================================================================================
+8. packages/server — Express API + WebSocket
+================================================================================
+
+8.1 서버 생성
+─────────────
+
+■ createServer(options) (createServer.ts):
+  - HTTP 서버 + WebSocket 서버 생성
+  - listen(port, host) / close()
+
+■ createApp(options) (app.ts):
+  - 미들웨어: helmet, cors, compression, express.json()
+  - GET /api/health 엔드포인트
+  - /api/ 라우트 마운트
+  - 정적 파일 서빙 (SPA fallback)
+  - app.locals에 주입: db, wss, orchestrator, chatFn, skillLoader
+
+8.2 라우트 (src/routes/)
+────────────────────────
+
+■ projects.ts: GET/POST/PUT/DELETE /projects, /projects/:id
+
+■ agents.ts:
+  - GET /projects/:projectId/agents — 에이전트 목록
+  - POST /projects/:projectId/agents — 생성 (auto-position)
+  - GET /agents/:id — 상세
+  - PUT /agents/:id — 수정 + visualState 변경 시 WebSocket broadcast
+  - DELETE /agents/:id — 삭제 + FK 정리 + agent:deleted broadcast
+
+■ tasks.ts:
+  - GET/POST /projects/:projectId/tasks
+  - GET/PUT /tasks/:id
+  - PUT /tasks/:id/transition — TaskStateMachine 기반 상태 전이 + broadcast
+
+■ workflows.ts:
+  - GET/POST /projects/:projectId/workflows
+  - GET/PUT /workflows/:id
+  - POST /workflows/:id/start — Orchestrator 실행
+
+■ chat.ts — CEO↔PM 채팅 (핵심 플로우):
+
+  POST /projects/:projectId/chat
+
+  ① 3단계 의도 분류 (Intent Classification):
+
+    Tier 1 — 키워드 사전 판별 (keywordClassify):
+      DIRECTIVE_PATTERNS (45개 정규식):
+        한국어: 개발|구현|만들어|생성|제작|작성|빌드|수정|변경|삭제|추가|배포|
+                테스트|해줘|해주세요|하세요|합시다|하자|페이지|컴포넌트|기능|
+                API|서버|DB|데이터베이스
+        영어: implement|develop|build|fix|deploy|test|feature|api
+      CHAT_PATTERNS (4개): 인사, 감사, 질문, 일상
+      판정: 2+ directive 키워드 → 0.85 confidence (directive)
+            1 directive (no chat) → 0.7 confidence
+            chat 패턴만 → 0.75 confidence (chat)
+
+    Tier 2 — LLM 분류 (confidence < 0.7인 경우):
+      시스템 프롬프트로 한국어/영어 의도 분류 요청
+      JSON 응답 파싱: {"intent":"chat"|"directive","confidence":0.0-1.0}
+
+    Tier 3 — 최종 폴백:
+      키워드 결과 사용 또는 기본값 "chat"
+      긴 메시지(>20자) + uncertain → directive 쪽으로
+
+  ② directive 판정 시:
+    - 루트 태스크 생성 (parentTask)
+    - PM.decompose() → 서브태스크 분해
+    - assignSubtasks() → 라운드로빈 배분
+    - executeSubtasks() → 비동기 실행 + 채팅 진행 상황 broadcast
+
+  ③ chat 판정 시:
+    - PM이 대화로 응답 (최근 20개 메시지 컨텍스트)
+
+  ④ assignSubtasks() — 라운드로빈 부하 분산:
+    - 역할별 에이전트 그룹화
+    - 배치 내 할당 횟수 추적, 최소 할당 에이전트 우선
+    - 같은 역할 에이전트 간 균등 배분
+
+  ⑤ detectBestRole() — 키워드 기반 역할 감지:
+    DEVELOPER: implement, code, develop, frontend, backend, 개발, 구현, 코드...
+    REVIEWER: review, check, 리뷰, 검토...
+    TESTER: test, qa, 테스트, 검증...
+    DEVOPS: deploy, ci, docker, 배포, 인프라...
+    PM: plan, manage, 기획, 관리...
+
+  ⑥ ensureAgentForRole() — 필요한 역할 에이전트 자동 생성
+
+  ⑦ executeSubtasks() — 비동기 실행 플로우:
+    각 서브태스크마다:
+      1. 에이전트 찾기 (없으면 자동 생성)
+      2. agent.visualState → WORKING
+      3. task.status → IN_PROGRESS
+      4. SkillLoader.selectSkills() → 관련 도구 선택
+      5. LLM 호출 (도구 포함)
+      6. Tool-use 루프 (최대 5 반복): 도구 호출 → 결과 → 다음 호출
+      7. task.status → DONE/FAILED
+      8. agent.visualState → IDLE
+      9. 채팅 진행 상황 broadcast
+
+  ⑧ broadcastChatStatus() — 채팅 상태 메시지:
+    시작: "[1/N] Task Title 시작 → Agent Name"
+    성공: "✓ Task Title 완료 (Agent Name)\nPreview..."
+    실패: "✗ Task Title 실패 (Agent Name)\nError..."
+    요약: "전체 작업 완료: X/N 성공, Y/N 실패"
+
+■ directive.ts — 명시적 지시 처리:
+  POST /projects/:projectId/directive
+  (chat.ts와 동일한 분해/할당/실행 로직, 의도 분류 없이 항상 directive)
+
+■ metrics.ts: GET /metrics/tokens — 토큰 사용량 요약
+
+8.3 WebSocket (src/websocket/)
+──────────────────────────────
+
+■ WebSocketManager:
+  - 30초 heartbeat (ping/pong)
+  - 클라이언트 프로젝트 구독: { type: 'subscribe', projectId }
+  - broadcast(event): 전체 클라이언트
+  - broadcastToProject(projectId, event): 구독 클라이언트만
+
+■ 이벤트 타입:
+  서버 → 클라이언트:
+    agents:sync     — 에이전트 목록 동기화
+    agent:update    — 단일 에이전트 업데이트
+    agent:deleted   — 에이전트 삭제됨
+    tasks:sync      — 태스크 목록 동기화
+    task:update     — 단일 태스크 업데이트
+    chat:message    — 채팅 메시지
+    time:update     — 시간 업데이트
+    subscribed      — 구독 확인
+    workflow:update  — 워크플로우 업데이트
+
+  클라이언트 → 서버:
+    subscribe       — 프로젝트 구독
+
+8.4 이벤트 브릿지 (bridge.ts)
+─────────────────────────────
+
+■ createEventBridge(emitter, wss, db):
+  Orchestrator 이벤트 → WebSocket broadcast 변환
+  AGENT_STATE_CHANGED → agent:update
+  TASK_STATUS_CHANGED → task:update
+  WORKFLOW_STATUS_CHANGED → workflow:update
+
+■ setupSubscribeSync(wss, db):
+  클라이언트 구독 시 → agents:sync + tasks:sync 전송
+
+================================================================================
+9. packages/cli — CLI 엔트리 포인트
+================================================================================
+
+■ commander.js 기반 커맨드:
+  mct-madev start [--port] [--no-open]  — 서버 시작
+  mct-madev init [-f]                   — 프로젝트 초기화
+  mct-madev status [--port]             — 서버 상태 확인
+  mct-madev stop [--port]               — 서버 중지
+
+  mct-madev agent add                   — 인터랙티브 에이전트 추가
+  mct-madev agent list                  — 에이전트 목록
+  mct-madev agent show <id>             — 에이전트 상세
+  mct-madev agent update <id>           — 에이전트 수정
+  mct-madev agent remove <id>           — 에이전트 삭제
+
+  mct-madev skill init/list/add/show/remove/validate
+
+■ start 커맨드 초기화 순서 (start.ts):
+  1. SqliteDatabase(.mct-madev/data.db) 초기화
+  2. Gateway 자동 감지:
+     ANTHROPIC_API_KEY → AnthropicProvider
+     OPENAI_API_KEY → OpenAIProvider
+     GOOGLE_API_KEY → GoogleProvider
+     OLLAMA_BASE_URL/OLLAMA_HOST 또는 localhost:11434 → OllamaProvider
+  3. SkillLoader (.madev/agents/skills/*.json + madev.md)
+  4. Orchestrator(db + chatFn + emitter)
+  5. Server(HTTP + WebSocket + 정적 UI)
+  6. EventBridge(orchestrator → WebSocket)
+  7. SubscribeSync(구독 시 초기 데이터 동기화)
+  8. 기본 프로젝트 생성 (없으면) — repoPath = process.cwd()
+  9. 기존 프로젝트 repoPath 미설정 시 자동 업데이트
+  10. InteractiveMenu 실행
+
+■ agent 커맨드 (agent.ts):
+  - @inquirer/prompts 사용 (input, select, confirm, editor)
+  - API 호출: http://localhost:{port}/api/...
+  - 프로젝트 선택 → 에이전트 관리
+  - 프로바이더 목록: anthropic, openai, google, ollama, kimi, minimax, glm
+
+■ menu.ts — 인터랙티브 메뉴 (서버 시작 후)
+
+================================================================================
+10. apps/web — React Three Fiber 3D 오피스 UI
+================================================================================
+
+10.1 앱 구조 (App.tsx)
+──────────────────────
+
+<div style="width:100vw, height:100vh">
+  <Canvas shadows camera={pos:[15,20,15], fov:50, toneMapping:ACES}>
+    <OfficeScene />
+  </Canvas>
+  <HUD />             <!-- 상단 바 -->
+  <StatusLog />       <!-- 좌측 상단 상태 로그 -->
+  <AgentDetailPanel /> <!-- 우측 에이전트 상세 -->
+  <TaskList />        <!-- 하단 태스크 목록 -->
+  <ChatPanel />       <!-- 우측 하단 채팅 -->
+</div>
+
+초기화: useWebSocket() + useIdleBehavior()
+프로젝트 로드: /api/projects → 첫 번째 프로젝트 로드 또는 데모 데이터 폴백
+
+10.2 Zustand 스토어 (store/useStore.ts)
+───────────────────────────────────────
+
+■ 타입:
+  AgentVisualState: IDLE|WORKING|COFFEE|READING|WALKING|CHATTING|NAPPING|GAMING|THINKING
+  AgentRole: PM|DEVELOPER|REVIEWER|TESTER|DEVOPS
+  TaskStatus: CREATED|PLANNING|REVIEWING|APPROVED|IN_PROGRESS|CODE_REVIEW|MERGING|DONE|
+              REJECTED|BLOCKED|FAILED
+  LogLevel: info|success|error|warn
+
+  AgentState: { id, name, role, visualState, position:{x,y,z}, currentTaskId? }
+  TaskState: { id, title, status, assigneeAgentId?, description?, result?, error?, parentTaskId? }
+  LogEntry: { id, level, message, detail?, timestamp }
+  ChatMessage: { role:'user'|'assistant', content, sender?, timestamp }
+
+■ 상태:
+  connected: boolean
+  currentProjectId/Name/RepoPath: string|null
+  agents: AgentState[]
+  tasks: TaskState[]
+  chatMessages: ChatMessage[]
+  chatOpen: boolean
+  logEntries: LogEntry[] (최대 200개 유지)
+  logOpen: boolean
+  logUnread: number
+  selectedAgentId: string|null
+  currentHour: number (KST)
+
+■ 주요 액션:
+  updateTask(id, updates): upsert 패턴 (없으면 추가)
+  loadProject(projectId): /api/projects/{id}, /api/projects/{id}/agents,
+                          /api/projects/{id}/tasks 동시 호출
+  addLogEntry(entry): ID + timestamp 자동 생성, 200개 제한, unread 카운트
+
+■ 데모 데이터 (API 실패 시 폴백):
+  6 에이전트: Alice(PM), Bob(Dev), Charlie(Dev), Diana(Review), Eve(Test), Frank(DevOps)
+  6 태스크: 다양한 상태
+
+10.3 useWebSocket 훅 (hooks/useWebSocket.ts)
+─────────────────────────────────────────────
+
+■ 연결: ws://hostname:port/ws
+  지수 백오프 재연결 (1초 → 30초 max)
+  프로젝트 구독: { type: 'subscribe', projectId }
+
+■ 메시지 핸들러:
+  agents:sync → setAgents()
+  agent:update → updateAgent() + WORKING/IDLE 전환 로그
+  agent:deleted → removeAgent()
+  tasks:sync → setTasks() (전체 필드 매핑)
+  task:update → updateTask() + 상태별 로그:
+    CREATED → info "Task created: {title}"
+    IN_PROGRESS → info "{title} started" + "Assigned to {agent}"
+    DONE → success "{title} completed" + result 미리보기
+    FAILED → error "{title} failed" + error 메시지
+  time:update → setCurrentHour()
+  chat:message → addChatMessage()
+  subscribed → (확인만)
+
+■ KST 시간: 60초마다 로컬 시간 동기화 (UTC+9)
+
+10.4 useIdleBehavior 훅 (hooks/useIdleBehavior.ts)
+──────────────────────────────────────────────────
+
+■ 5개 존 정의:
+  CEO:   center(-8, -7), halfW:2, halfD:1.5, POI 3개
+  PM:    center(0, -7), halfW:2.5, halfD:1.5, POI 4개
+  DEV:   center(-1.5, 1), halfW:4.2, halfD:2.5, POI 8개 (가장 큰 방)
+  WAR:   center(8, -2), halfW:2, halfD:2.5, POI 4개
+  BREAK: center(-4, 7), halfW:3.5, halfD:1.5, POI 5개
+
+■ 역할-홈 매핑:
+  PM → PM방, DEVELOPER → DEV방, REVIEWER/TESTER → WAR방, DEVOPS → BREAK방
+
+■ 복도 시스템: 10개 양방향 경로 (웨이포인트 기반)
+  CEO↔PM, PM↔DEV, DEV↔WAR, DEV↔BREAK, WAR↔BREAK 등
+  각 복도는 중간 경유점 2~3개
+
+■ 워킹 로직:
+  - 같은 존 내: POI 1-3개 랜덤
+  - 다른 존: 복도 웨이포인트 + 목적지 POI
+  - 목적지 선택: 25% 현재 존 유지, 25% 홈, 50% 랜덤
+  - WALK_STEP_MS = 2500ms (웨이포인트 간)
+  - MIN_IDLE_MS = 5000, MAX_IDLE_MS = 14000
+
+■ 존별 행동 가중치:
+  BREAK: COFFEE 35%, NAPPING 20%, GAMING 20%, CHATTING 15%, READING 10%
+  WAR: CHATTING 35%, THINKING 25%, READING 25%, COFFEE 15%
+  CEO/PM: THINKING 30%, READING 25%, CHATTING 20%, COFFEE 15%, NAPPING 10%
+  DEV: READING 25%, THINKING 25%, GAMING 15%, COFFEE 15%, CHATTING 10%, NAPPING 10%
+
+10.5 3D 씬 (scene/)
+────────────────────
+
+■ OfficeScene.tsx:
+  <DayNightCycle /> + <Lighting /> + <OrbitControls /> + <Floor /> + <Rooms />
+  + {agents.map(a => <AgentCharacter />)}
+  OrbitControls: minPolar 0.2, maxPolar π/2.2, distance 5-40, damping 0.08
+
+■ AgentCharacter.tsx — 기하학적 캐릭터:
+  구조:
+    Head (1.65m): 0.45³ 둥근 박스, 피부색 #FFD5B8, 눈 2개(검정 구), 입(빨간 박스)
+    Body (1.1m): 0.55×0.65×0.3 박스, 역할 색상
+    Arms (1.1m): 0.18×0.55×0.22 박스 × 2, 역할 색상
+    Legs (0.35m): 0.2×0.7×0.24 박스 × 2, 다크 그레이 #334
+
+  역할별 색상:
+    PM=#4488FF, DEVELOPER=#44CC66, REVIEWER=#FF8844,
+    TESTER=#AA66DD, DEVOPS=#DD4444
+
+  애니메이션 (useFrame):
+    - 위치: lerp 보간 (walking: 0.035, 기타: 0.05)
+    - 수직 바운스: sin(t*2) * 0.06
+    - 팔 상태별: WORKING(타이핑), COFFEE(오른팔 위), READING(양팔 책),
+      CHATTING(제스처), WALKING(스윙), GAMING(컨트롤러), THINKING(턱 짚기)
+    - 다리: WALKING 시 sin(t*5)*0.12 교차 진동
+    - 머리: THINKING 시 기울임 sin(t*1.5)*0.15
+    - 몸통 회전: 이동 방향으로 부드러운 회전 (0.08 보간)
+      ** 앵글 wraparound 처리:
+         diff = targetAngle - currentAngle
+         while diff > π: diff -= 2π
+         while diff < -π: diff += 2π
+    - NAPPING: 몸통 z-rotation π/2 (누워있기)
+
+  선택 시: 골드 링 (#FFD700) + HTML 이름표 (역할색 테두리)
+
+■ Rooms.tsx — 5개 방:
+  CEO방 (-8,0,-7): 5×2.5×4, 노란색 #FFD700, 책상+모니터+의자
+  PM허브 (0,0,-7): 6×2.2×4, 파란색 #4488FF, 책상×2+모니터×2+의자×2
+  Dev존 (-1.5,0,1): 10×2×6, 초록 #44CC66, 책상×6+모니터×6+의자×6
+  War룸 (8,0,-2): 5×2.2×6, 주황 #FF8844, 회의 테이블+의자×4
+  Break룸 (-4,0,7): 8×1.8×4, 마젠타 #CC44CC, 소파×2+커피 머신
+
+  가구: Desk(나무 상판+4다리), Chair(좌석+등받이+원통 받침),
+        Monitor(스크린+발광면+스탠드), MeetingTable(대형 원탁),
+        Couch(쿠션+등받이), CoffeeMachine(본체+빨간 상단)
+
+■ Floor.tsx: 30×24 평면 #2a2a3e + 30×30 그리드
+
+■ Lighting.tsx — 동적 조명:
+  Day Factor: 8-19시=1.0, 21-6시=0.0, 6-8/19-21시=선형 보간
+  Ambient: 0.6(낮)→0.15(밤), warm white↔night blue
+  Directional(태양): 1.2(낮)→0.1(밤), 시간별 위치(cos/sin 계산)
+  Shadow: 2048×2048, bounds [-18,18]
+  Point lights (5방): CEO(warm), PM(cool), Dev(green), War(warm), Break(pink)
+
+■ DayNightCycle.tsx:
+  배경색: #0a0a1a(밤) → #87CEEB(낮), 30% day factor
+  Fog: FogExp2, density 0.018(밤)→0.008(낮)
+
+10.6 UI 컴포넌트 (ui/)
+──────────────────────
+
+■ HUD.tsx — 상단 바:
+  좌측: MCT-MADEV 로고 + 프로젝트명(파란색) + 연결상태(초록/빨강 글로우)
+        + repoPath(모노스페이스, 반투명, 최대300px truncate+툴팁)
+  중앙: HH:MM KST (모노스페이스, 파란색)
+  우측: Active(노란), Done(초록), Total(회색) 태스크 카운트
+  하단: 그라디언트 라인 (blue→green→orange)
+
+■ ChatPanel.tsx — 채팅 패널 (3모드):
+
+  ① 버블: 52×52px 원형 버튼, 우하단, 파란→초록 그라디언트, pulse 애니메이션
+  ② 입력바: 380px, 글래스모피즘, 좌측 그라디언트 악센트바, 슬라이드 애니메이션
+  ③ 채팅창: 420×520px, PM 아바타 헤더, 메시지 영역, 하단 입력
+
+  메시지 스타일:
+    일반: user(우정렬, 파란 그라디언트), assistant(좌정렬, 반투명 흰색)
+    상태메시지 (regex /^(\[[\d/]+\]|✓|✗|전체)/):
+      성공(✓): 초록 텍스트+테두리, 실패(✗): 빨강 텍스트+배경,
+      요약(전체): 파란 배경+볼드, 진행중: 파란 테두리
+
+  타이핑 인디케이터: 3점 바운싱 (stagger 0/0.15/0.3초)
+  전송: POST /api/projects/{projectId}/chat
+  "CEO" sender로 즉시 표시 → 응답 대기
+
+■ StatusLog.tsx — 상태 로그:
+  위치: 좌상단 (top:52px, panel:top:90px — HUD 겹침 방지)
+  토글 버튼: 활동 차트 아이콘 + "Status" + unread 뱃지(pulse 애니메이션)
+  요약 카운터: "5 done / 2 err / 10"
+
+  로그 엔트리: 레벨별 색상
+    info: #88bbff, success: #44CC66 + ✔, error: #ff6b6b + ✖, warn: #ffaa44 + ⚠
+  좌측 2px 테두리, hover시 배경 틴트
+  자동 열림 (첫 이벤트 시), 자동 스크롤
+
+■ TaskList.tsx — 태스크 목록:
+  위치: 하단 바 (전체 너비)
+  접기/펴기 토글, 필터 탭 (Active/All/Done)
+
+  태스크 카드: 상태 아이콘 + 제목 + 상태 뱃지(색상) + 담당자
+  계층 구조: 부모 태스크 → 서브태스크 연결선(파란 그라디언트)
+  진행바: 부모별 (초록 done + 시안 inProgress + 빨강 failed)
+  에러/결과: 클릭 시 펼침
+
+  상태 색상:
+    CREATED:#888, PLANNING:#6688CC, REVIEWING:#CC8844, APPROVED:#44AA66,
+    IN_PROGRESS:#44BBAA, CODE_REVIEW:#CCAA44, MERGING:#4488CC, DONE:#44CC66,
+    REJECTED:#CC4444, BLOCKED:#CC6644, FAILED:#CC3333
+
+  정렬: IN_PROGRESS(0) → CODE_REVIEW → REVIEWING → PLANNING → APPROVED →
+        MERGING → CREATED → BLOCKED → DONE → REJECTED → FAILED
+
+■ AgentDetailPanel.tsx — 에이전트 상세:
+  위치: 우상단, 288px 너비, 우측에서 슬라이드인
+  내용: 이름+역할뱃지, 상태(애니메이션 점+이모지), 좌표(모노스페이스),
+        현재 태스크(카드)
+  역할색 테두리
+
+10.7 디자인 시스템
+──────────────────
+
+■ 글래스모피즘:
+  background: rgba(15, 20, 40, 0.65) ~ rgba(10, 14, 30, 0.82)
+  backdrop-filter: blur(12px ~ 20px)
+  border: 1px solid rgba(255, 255, 255, 0.06 ~ 0.12)
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3 ~ 0.4)
+
+■ 색상 팔레트:
+  배경: #0a0a1a ~ #0a0f28 (다크 네이비)
+  주요: #4488FF (파란), #44CC66 (초록), #FF8844 (주황)
+  성공: #44CC66, 에러: #CC3333~#ff6b6b, 경고: #ffaa44
+  텍스트: rgba(255,255,255,0.85-0.9)
+  비활성: rgba(255,255,255,0.25-0.6)
+
+■ 폰트: "Inter", system-ui, sans-serif
+  크기: 9px(최소) ~ 14px(본문) ~ 18px+(제목)
+  무게: 400/500/600/700
+
+■ 애니메이션:
+  시간: 0.2s(마이크로), 0.25s(표준), 0.3-0.35s(대화상자)
+  이징: cubic-bezier(0.4, 0, 0.2, 1)
+  효과: fade, scale, slide, blur
+
+■ 스크롤바: 4px, 투명 트랙, 반투명 썸
+
+================================================================================
+11. 설정 파일
+================================================================================
+
+■ 루트 package.json:
+  "workspaces": ["packages/*", "apps/*"]
+  scripts: build, clean, test, dev, lint
+
+■ pnpm-workspace.yaml:
+  packages:
+    - 'packages/*'
+    - 'apps/*'
+
+■ tsconfig.json (루트):
+  compilerOptions:
+    target: ES2022, module: Node16, moduleResolution: Node16,
+    strict: true, esModuleInterop: true,
+    declaration: true, declarationMap: true, sourceMap: true,
+    outDir: dist, rootDir: src
+
+■ biome.json:
+  formatter: indentStyle=space, indentWidth=2, lineWidth=100
+  javascript.formatter: quoteStyle=single, trailingCommas=all, semicolons=always
+
+■ .env.example:
+  ANTHROPIC_API_KEY=sk-ant-...
+  OPENAI_API_KEY=sk-...
+  GOOGLE_API_KEY=...
+  KIMI_API_KEY=...
+  MINIMAX_API_KEY=...
+  GLM_API_KEY=...
+  OLLAMA_BASE_URL=http://localhost:11434
+  PORT=3000
+  HOST=0.0.0.0
+
+■ 각 패키지 tsup.config.ts:
+  entry: ['src/index.ts'], format: ['esm'], dts: true, clean: true,
+  target: 'es2022', sourcemap: true
+
+■ apps/web/vite.config.ts:
+  plugins: [react(), tailwindcss()]
+
+■ docker-compose.yml:
+  services: server(node), web(nginx), postgres, redis
+
+================================================================================
+12. 의존성 목록
+================================================================================
+
+■ packages/core:
+  yaml: ^2.7.0, zod: ^3.24.2
+
+■ packages/gateway:
+  @mct-madev/core: workspace:*
+
+■ packages/db:
+  @mct-madev/core: workspace:*, sql.js: ^1.12.0
+
+■ packages/queue:
+  @mct-madev/core: workspace:*, better-queue: ^3.8.12
+
+■ packages/git:
+  @mct-madev/core: workspace:*
+
+■ packages/server:
+  @mct-madev/core: workspace:*, express: ^4.21.2, ws: ^8.18.0,
+  cors: ^2.8.5, helmet: ^8.0.0, compression: ^1.7.5
+
+■ packages/cli:
+  @mct-madev/core, @mct-madev/db, @mct-madev/gateway, @mct-madev/server: workspace:*
+  commander: ^13.1.0, @inquirer/prompts: ^7.3.2, chalk: ^5.4.1, open: ^10.1.0
+
+■ apps/web:
+  react: ^19.0.0, react-dom: ^19.0.0,
+  @react-three/fiber: ^9.1.2, @react-three/drei: ^10.3.4, three: ^0.175.0,
+  zustand: ^5.0.3
+  devDependencies: typescript: ^5.7.3, vite: ^6.1.0, tailwindcss: ^4.1.8,
+                   @tailwindcss/vite, @vitejs/plugin-react
+
+================================================================================
+13. 실행 방법
+================================================================================
+
+# 설치 & 빌드
+pnpm install
+pnpm build
+
+# 환경변수 설정
+cp .env.example .env
+# .env 파일에 API 키 입력 (최소 하나, Ollama는 로컬 실행)
+
+# 서버 시작
+node packages/cli/dist/index.js start
+
+# 브라우저에서 http://localhost:3000 자동 열림
+# CLI 인터랙티브 메뉴에서 에이전트 관리 가능
+
+# 에이전트 CLI 관리
+node packages/cli/dist/index.js agent add
+node packages/cli/dist/index.js agent list
+node packages/cli/dist/index.js agent remove <id>
+
+================================================================================
+14. 핵심 아키텍처 패턴
+================================================================================
+
+1. 이벤트 드리븐: EventEmitter → WebSocket broadcast → Zustand 반영
+2. DB 추상화: OrchestratorDeps/IDatabase로 구현체 분리
+3. 프로바이더 패턴: IProvider로 7개 LLM 통합
+4. 상태 머신: TaskStateMachine으로 유효한 태스크 전이만 허용
+5. DAG 실행: TaskDAG로 의존성 순서 보장
+6. 실시간 동기화: WebSocket + Zustand 반응형 UI
+7. 3D 시각화: Three.js 상태 기반 애니메이션
+8. 스킬 시스템: JSON 기반 확장 가능 도구
+9. 의존성 주입: app.locals로 서비스 전달
+10. 비동기 실행: fire-and-forget + broadcast로 블로킹 방지
+11. 3단계 의도 분류: 키워드 → LLM → 폴백 (한국어/영어)
+12. 라운드로빈 부하 분산: 역할별 그룹화 + 최소 할당 우선
+13. 글래스모피즘 UI: 반투명 + blur + 미묘한 테두리 + 그림자
+14. 웨이포인트 기반 이동: 복도 경유점으로 벽 통과 방지
+
+================================================================================
+15. 알려진 주의사항
+================================================================================
+
+- 백엔드/DB 타임스탬프는 UTC, UI 표시는 KST (UTC+9)
+- sql.js는 WASM 기반이므로 초기 로딩 시 wasm 파일 필요
+- PRAGMA foreign_keys = ON 상태 → agent 삭제 시 FK 참조 먼저 정리 필수
+- Ollama 프로바이더는 로컬 서버 필요 (기본 localhost:11434)
+- 데모 데이터는 API 연결 실패 시 자동 폴백
+- TaskList의 updateTask는 upsert 패턴 (존재하지 않으면 새로 추가)
+- 채팅 의도 분류는 소형 모델에서 부정확할 수 있어 키워드 사전 판별을 우선
+
+================================================================================
+끝 (End of Initial Prompt)
+================================================================================

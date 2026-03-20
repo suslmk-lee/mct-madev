@@ -1,0 +1,21 @@
+{
+  "name": "mct-madev",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Multi-Agent Orchestration System with 3D Office UI",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "test": "pnpm -r test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "clean": "pnpm -r clean"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}
