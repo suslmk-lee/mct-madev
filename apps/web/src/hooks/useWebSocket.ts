@@ -164,6 +164,16 @@ export function useWebSocket() {
         case 'agent:deleted':
           if (p?.id) removeAgent(p.id as string);
           break;
+        case 'project:status_changed':
+          if (p?.newStatus) {
+            useStore.getState().projectStatus !== p.newStatus &&
+              useStore.setState({ projectStatus: p.newStatus as 'ACTIVE' | 'SUSPENDED' | 'CLOSED' });
+            const statusLabel = p.newStatus === 'ACTIVE' ? '프로젝트 재개' : p.newStatus === 'SUSPENDED' ? '프로젝트 일시중지' : '프로젝트 종료';
+            addLogEntry({ level: 'info', message: statusLabel });
+            // Refresh projects list
+            useStore.getState().loadProjects();
+          }
+          break;
         case 'subscribed':
           // Subscription confirmed
           break;

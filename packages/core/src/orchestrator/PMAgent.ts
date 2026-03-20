@@ -13,7 +13,7 @@ export interface SubtaskDef {
   metadata: Record<string, unknown>;
 }
 
-export interface ProjectStatus {
+export interface ProjectStatusReport {
   projectId: string;
   workflowName: string;
   tasks: Array<{
@@ -127,7 +127,7 @@ ${result}`,
   /**
    * Generate a status report for the project.
    */
-  report(projectStatus: ProjectStatus): string {
+  report(projectStatus: ProjectStatusReport): string {
     const { projectId, workflowName, tasks, completedCount, totalCount } = projectStatus;
     const pct = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
 

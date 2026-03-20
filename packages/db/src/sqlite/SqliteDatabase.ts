@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS projects (
   name TEXT NOT NULL,
   description TEXT,
   repo_path TEXT,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
   config TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -118,6 +119,7 @@ interface ProjectRow {
   name: string;
   description: string | null;
   repo_path: string | null;
+  status: string;
   config: string;
   created_at: string;
   updated_at: string;
@@ -225,6 +227,7 @@ function rowToProject(row: ProjectRow): Project {
     config: JSON.parse(row.config),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    status: (row.status ?? 'ACTIVE') as any,
   };
 }
 
@@ -336,6 +339,14 @@ export class SqliteDatabase implements IDatabase {
 
     this.db.run('PRAGMA foreign_keys = ON');
     this.db.run(INIT_SQL);
+
+    // Migrate: add status column to projects if missing
+    try {
+      this.db.run('SELECT status FROM projects LIMIT 1');
+    } catch {
+      this.db.run("ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'");
+      this.save();
+    }
   }
 
   private save(): void {
@@ -356,9 +367,9 @@ export class SqliteDatabase implements IDatabase {
     const id = crypto.randomUUID();
     const ts = now();
     this.db.run(
-      `INSERT INTO projects (id, name, description, repo_path, config, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [id, project.name, project.description ?? null, project.repoPath ?? null, JSON.stringify(project.config), ts, ts],
+      `INSERT INTO projects (id, name, description, repo_path, status, config, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, project.name, project.description ?? null, project.repoPath ?? null, (project as any).status ?? 'ACTIVE', JSON.stringify(project.config), ts, ts],
     );
     this.save();
     return (await this.getProject(id))!;
@@ -385,6 +396,7 @@ export class SqliteDatabase implements IDatabase {
     if (updates.description !== undefined) { sets.push('description = ?'); values.push(updates.description); }
     if (updates.repoPath !== undefined) { sets.push('repo_path = ?'); values.push(updates.repoPath); }
     if (updates.config !== undefined) { sets.push('config = ?'); values.push(JSON.stringify(updates.config)); }
+    if ((updates as any).status !== undefined) { sets.push('status = ?'); values.push((updates as any).status); }
 
     values.push(id);
     this.db.run(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`, values as (string | number | null)[]);

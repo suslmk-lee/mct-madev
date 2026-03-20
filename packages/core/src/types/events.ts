@@ -6,6 +6,7 @@ export const EventType = {
   MESSAGE_CREATED: 'MESSAGE_CREATED',
   TOKEN_USAGE_UPDATED: 'TOKEN_USAGE_UPDATED',
   LOG_ENTRY: 'LOG_ENTRY',
+  PROJECT_STATUS_CHANGED: 'PROJECT_STATUS_CHANGED',
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];

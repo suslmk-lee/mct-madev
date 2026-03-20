@@ -7,7 +7,7 @@ interface Position {
 }
 
 /** Default positions for each role, with multiple slots per role */
-const ROLE_POSITIONS: Record<string, Position[]> = {
+export const ROLE_POSITIONS: Record<string, Position[]> = {
   PM: [
     { x: 0, y: 0, z: -6 },
     { x: 2, y: 0, z: -6 },
@@ -31,6 +31,17 @@ const ROLE_POSITIONS: Record<string, Position[]> = {
     { x: -7, y: 0, z: 6 },
   ],
 };
+
+export const BREAK_ROOM_POSITIONS: Position[] = [
+  { x: -6, y: 0, z: 7 },
+  { x: -5, y: 0, z: 6.5 },
+  { x: -4, y: 0, z: 7.5 },
+  { x: -3, y: 0, z: 6 },
+  { x: -2, y: 0, z: 7 },
+  { x: -5, y: 0, z: 8 },
+  { x: -3, y: 0, z: 8 },
+  { x: -7, y: 0, z: 7 },
+];
 
 const DEFAULT_POSITION: Position = { x: 0, y: 0, z: 0 };
 

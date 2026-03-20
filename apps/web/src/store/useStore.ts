@@ -33,6 +33,9 @@ export interface AgentState {
   visualState: AgentVisualState;
   position: { x: number; y: number; z: number };
   currentTaskId?: string;
+  provider?: string;
+  model?: string;
+  systemPrompt?: string;
 }
 
 export interface TaskState {
@@ -63,6 +66,16 @@ export interface ChatMessage {
   timestamp: string;
 }
 
+export type ProjectStatus = 'ACTIVE' | 'SUSPENDED' | 'CLOSED';
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  status: ProjectStatus;
+  description?: string;
+  repoPath?: string;
+}
+
 interface AppStore {
   // Connection
   connected: boolean;
@@ -72,13 +85,28 @@ interface AppStore {
   currentProjectId: string | null;
   currentProjectName: string | null;
   currentRepoPath: string | null;
+  projectStatus: ProjectStatus | null;
+  projects: ProjectSummary[];
+  projectModalOpen: boolean;
+  projectModalMode: 'list' | 'create';
   setCurrentProjectId: (id: string | null) => void;
+  setProjectModalOpen: (open: boolean, mode?: 'list' | 'create') => void;
+  loadProjects: () => Promise<void>;
+  createProject: (data: { name: string; repoPath: string; description?: string; teamPreset?: string; config?: Record<string, unknown> }) => Promise<string | null>;
+  suspendProject: () => Promise<void>;
+  closeProject: () => Promise<void>;
+  resumeProject: (id: string) => Promise<void>;
 
   // Agents
   agents: AgentState[];
   setAgents: (agents: AgentState[]) => void;
   updateAgent: (id: string, updates: Partial<AgentState>) => void;
   removeAgent: (id: string) => void;
+  addAgentApi: (data: { name: string; role: string; provider: string; model: string; systemPrompt?: string }) => Promise<boolean>;
+  updateAgentApi: (id: string, data: Record<string, unknown>) => Promise<boolean>;
+  deleteAgentApi: (id: string) => Promise<boolean>;
+  agentPanelMode: 'detail' | 'list' | 'add' | 'edit';
+  setAgentPanelMode: (mode: 'detail' | 'list' | 'add' | 'edit') => void;
 
   // Tasks
   tasks: TaskState[];
@@ -141,7 +169,101 @@ export const useStore = create<AppStore>((set) => ({
   currentProjectId: null,
   currentProjectName: null,
   currentRepoPath: null,
+  projectStatus: null,
+  projects: [],
+  projectModalOpen: false,
+  projectModalMode: 'list',
   setCurrentProjectId: (id) => set({ currentProjectId: id }),
+  setProjectModalOpen: (open, mode) => set({ projectModalOpen: open, ...(mode ? { projectModalMode: mode } : {}) }),
+
+  loadProjects: async () => {
+    try {
+      const res = await fetch(`${API_BASE}/projects`);
+      if (!res.ok) return;
+      const data = await res.json();
+      set({
+        projects: (data.data ?? []).map((p: Record<string, unknown>) => ({
+          id: p.id as string,
+          name: p.name as string,
+          status: (p.status as ProjectStatus) ?? 'ACTIVE',
+          description: p.description as string | undefined,
+          repoPath: p.repoPath as string | undefined,
+        })),
+      });
+    } catch { /* ignore */ }
+  },
+
+  createProject: async (data) => {
+    try {
+      const body = {
+        name: data.name,
+        description: data.description,
+        repoPath: data.repoPath,
+        teamPreset: data.teamPreset,
+        config: data.config ?? {
+          defaultProvider: 'anthropic',
+          defaultModel: 'claude-sonnet-4-5',
+          gitEnabled: false,
+          maxConcurrentTasks: 5,
+        },
+      };
+      const res = await fetch(`${API_BASE}/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        console.error('[createProject] API error:', res.status, errData);
+        return null;
+      }
+      const result = await res.json();
+      const projectId = result.data?.id as string;
+      if (!projectId) {
+        console.error('[createProject] No project ID returned');
+        return null;
+      }
+      // Reload projects list and load the new project
+      await useStore.getState().loadProjects();
+      await useStore.getState().loadProject(projectId);
+      set({ projectModalOpen: false });
+      return projectId;
+    } catch (err) {
+      console.error('[createProject] error:', err);
+      return null;
+    }
+  },
+
+  suspendProject: async () => {
+    const { currentProjectId } = useStore.getState();
+    if (!currentProjectId) return;
+    try {
+      const res = await fetch(`${API_BASE}/projects/${currentProjectId}/suspend`, { method: 'POST' });
+      if (!res.ok) return;
+      set({ projectStatus: 'SUSPENDED' });
+      await useStore.getState().loadProjects();
+    } catch { /* ignore */ }
+  },
+
+  closeProject: async () => {
+    const { currentProjectId } = useStore.getState();
+    if (!currentProjectId) return;
+    try {
+      const res = await fetch(`${API_BASE}/projects/${currentProjectId}/close`, { method: 'POST' });
+      if (!res.ok) return;
+      set({ projectStatus: 'CLOSED' });
+      await useStore.getState().loadProjects();
+    } catch { /* ignore */ }
+  },
+
+  resumeProject: async (id: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/projects/${id}/resume`, { method: 'POST' });
+      if (!res.ok) return;
+      await useStore.getState().loadProjects();
+      await useStore.getState().loadProject(id);
+    } catch { /* ignore */ }
+  },
 
   agents: [],
   setAgents: (agents) => set({ agents }),
@@ -150,6 +272,54 @@ export const useStore = create<AppStore>((set) => ({
       agents: state.agents.map((a) => (a.id === id ? { ...a, ...updates } : a)),
     })),
   removeAgent: (id) => set((state) => ({ agents: state.agents.filter((a) => a.id !== id) })),
+
+  agentPanelMode: 'detail' as const,
+  setAgentPanelMode: (mode) => set({ agentPanelMode: mode }),
+
+  addAgentApi: async (data) => {
+    const { currentProjectId } = useStore.getState();
+    if (!currentProjectId) return false;
+    try {
+      const res = await fetch(`${API_BASE}/projects/${currentProjectId}/agents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) return false;
+      const result = await res.json();
+      const agent = result.data;
+      if (agent) {
+        set((state) => ({ agents: [...state.agents, agent] }));
+      }
+      return true;
+    } catch { return false; }
+  },
+
+  updateAgentApi: async (id, data) => {
+    try {
+      const res = await fetch(`${API_BASE}/agents/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) return false;
+      const result = await res.json();
+      const agent = result.data;
+      if (agent) {
+        set((state) => ({ agents: state.agents.map((a) => a.id === id ? { ...a, ...agent } : a) }));
+      }
+      return true;
+    } catch { return false; }
+  },
+
+  deleteAgentApi: async (id) => {
+    try {
+      const res = await fetch(`${API_BASE}/agents/${id}`, { method: 'DELETE' });
+      if (!res.ok) return false;
+      set((state) => ({ agents: state.agents.filter((a) => a.id !== id), selectedAgentId: state.selectedAgentId === id ? null : state.selectedAgentId }));
+      return true;
+    } catch { return false; }
+  },
 
   tasks: [],
   setTasks: (tasks) => set({ tasks }),
@@ -213,6 +383,7 @@ export const useStore = create<AppStore>((set) => ({
         currentProjectId: projectId,
         currentProjectName: projectData?.data?.name ?? null,
         currentRepoPath: projectData?.data?.repoPath ?? null,
+        projectStatus: (projectData?.data?.status as ProjectStatus) ?? 'ACTIVE',
         agents: agentsData.data ?? [],
         tasks: (tasksData.data ?? []).map((t: Record<string, unknown>) => ({
           id: t.id as string,
@@ -231,6 +402,7 @@ export const useStore = create<AppStore>((set) => ({
         currentProjectId: null,
         currentProjectName: null,
         currentRepoPath: null,
+        projectStatus: null,
         agents: defaultAgents,
         tasks: defaultTasks,
       });

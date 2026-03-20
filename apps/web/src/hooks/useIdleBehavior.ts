@@ -198,8 +198,10 @@ interface WalkState {
 export function useIdleBehavior() {
   const agents = useStore((s) => s.agents);
   const updateAgent = useStore((s) => s.updateAgent);
+  const projectStatus = useStore((s) => s.projectStatus);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const walkStates = useRef<Map<string, WalkState>>(new Map());
+  const isSuspended = projectStatus === 'SUSPENDED' || projectStatus === 'CLOSED';
 
   useEffect(() => {
     const timers = timersRef.current;
@@ -258,8 +260,8 @@ export function useIdleBehavior() {
               const c = useStore.getState().agents.find((a) => a.id === agent.id);
               if (!c || c.visualState === 'WORKING') return;
 
-              // Pick context-appropriate idle state
-              const zone = walkStates.current.get(agent.id)?.currentZone ?? homeZone;
+              // Pick context-appropriate idle state (Break Room only when suspended)
+              const zone = isSuspended ? 'BREAK' as Zone : (walkStates.current.get(agent.id)?.currentZone ?? homeZone);
               const newState = pickContextBehavior(zone);
               updateAgent(agent.id, { visualState: newState });
               scheduleNextIdle();
@@ -271,8 +273,8 @@ export function useIdleBehavior() {
         // Not walking — pick new behavior
         const newState = pickIdleBehavior();
         if (newState === 'WALKING') {
-          // Start a walk
-          const destZone = pickDestinationZone(ws.currentZone, homeZone);
+          // Start a walk (when suspended, only walk within Break Room)
+          const destZone = isSuspended ? 'BREAK' as Zone : pickDestinationZone(ws.currentZone, homeZone);
           const path = buildWalkPath(
             { x: current.position.x, z: current.position.z },
             ws.currentZone,
@@ -328,7 +330,8 @@ export function useIdleBehavior() {
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
     };
-  }, [agents, updateAgent]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents, updateAgent, isSuspended]);
 }
 
 // ── Context-aware behavior ──

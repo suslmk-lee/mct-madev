@@ -6,6 +6,7 @@ import { AgentDetailPanel } from './ui/AgentDetailPanel';
 import { TaskList } from './ui/TaskList';
 import { ChatPanel } from './ui/ChatPanel';
 import { StatusLog } from './ui/StatusLog';
+import { ProjectModal } from './ui/ProjectModal';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useIdleBehavior } from './hooks/useIdleBehavior';
 import { useStore } from './store/useStore';
@@ -14,17 +15,21 @@ export function App() {
   useWebSocket();
   useIdleBehavior();
   const loadProject = useStore((s) => s.loadProject);
+  const loadProjects = useStore((s) => s.loadProjects);
 
   // On mount: fetch project list, load first project (or fall back to demo)
   useEffect(() => {
     (async () => {
       try {
+        await loadProjects();
         const res = await fetch('/api/projects');
         if (!res.ok) throw new Error('API unavailable');
         const data = await res.json();
-        const projects = data.data as Array<{ id: string }>;
-        if (projects.length > 0) {
-          await loadProject(projects[0].id);
+        const projects = data.data as Array<{ id: string; status?: string }>;
+        // Load first ACTIVE project, or first available
+        const active = projects.find((p) => p.status === 'ACTIVE') ?? projects[0];
+        if (active) {
+          await loadProject(active.id);
           return;
         }
       } catch {
@@ -54,8 +59,9 @@ export function App() {
       <AgentDetailPanel />
       <TaskList />
       <ChatPanel />
+      <ProjectModal />
 
-      {/* Global animation keyframes */}
+      {/* Global animation keyframes + dark select */}
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -64,6 +70,13 @@ export function App() {
         @keyframes float {
           0%, 100% { transform: translateY(0); }
           50% { transform: translateY(-8px); }
+        }
+        select option {
+          background: #1a1a2e;
+          color: #fff;
+        }
+        select option:checked {
+          background: #2a2a4e;
         }
       `}</style>
     </div>
