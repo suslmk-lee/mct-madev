@@ -129,6 +129,12 @@ interface AppStore {
   logUnread: number;
   resetLogUnread: () => void;
 
+  // Camera
+  cameraPreset: 'overview' | 'ceo' | 'pm' | 'dev' | 'warroom' | 'breakroom';
+  setCameraPreset: (preset: 'overview' | 'ceo' | 'pm' | 'dev' | 'warroom' | 'breakroom') => void;
+  followAgentId: string | null;
+  setFollowAgentId: (id: string | null) => void;
+
   // UI
   selectedAgentId: string | null;
   setSelectedAgentId: (id: string | null) => void;
@@ -358,6 +364,11 @@ export const useStore = create<AppStore>((set) => ({
   setLogOpen: (v) => set((state) => ({ logOpen: v, logUnread: v ? 0 : state.logUnread })),
   logUnread: 0,
   resetLogUnread: () => set({ logUnread: 0 }),
+
+  cameraPreset: 'overview',
+  setCameraPreset: (preset) => set({ cameraPreset: preset, followAgentId: null }),
+  followAgentId: null,
+  setFollowAgentId: (id) => set({ followAgentId: id }),
 
   selectedAgentId: null,
   setSelectedAgentId: (id) => set({ selectedAgentId: id }),

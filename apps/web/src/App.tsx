@@ -45,7 +45,7 @@ export function App() {
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
       <Canvas
         shadows
-        camera={{ position: [15, 20, 15], fov: 50 }}
+        camera={{ position: [25, 22, 25], fov: 30, near: 0.1, far: 500 }}
         gl={{ antialias: true, toneMapping: 3 /* ACESFilmic */ }}
         onPointerMissed={() => {
           // Deselect agent when clicking empty space

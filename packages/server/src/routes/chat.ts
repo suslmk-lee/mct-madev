@@ -1,4 +1,6 @@
 import { Router, type Request, type Response } from 'express';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { resolve, dirname, join } from 'node:path';
 import type { ServerDatabase } from '../database.js';
 import type { WebSocketManager } from '../websocket/index.js';
 import {
@@ -13,6 +15,213 @@ import {
   type SkillDefinition,
   type ExtendedChatResponse,
 } from '@mct-madev/core';
+
+// ── Built-in file system tools ────────────────────────────────────────────
+
+/** write_file and read_file tools given to every agent */
+const FILE_TOOLS: SkillDefinition[] = [
+  {
+    name: 'write_file',
+    description: 'Write content to a file in the project directory. Use this for EVERY file you create or modify. Do NOT output code in your text response — always use this tool.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path from project root, e.g. src/index.ts or Dockerfile' },
+        content: { type: 'string', description: 'Complete file content. Never truncate.' },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'read_file',
+    description: 'Read the current content of an existing file in the project.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path from project root' },
+      },
+      required: ['path'],
+    },
+  },
+];
+
+/** Execute a single tool call. Returns the result string to feed back to LLM. */
+function executeToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+  targetPath: string,
+  writtenFiles: string[],
+): string {
+  if (toolName === 'write_file') {
+    const filePath = String(input.path ?? '').trim();
+    const content = String(input.content ?? '');
+    if (!filePath) return 'Error: path is required';
+
+    const safe = filePath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    const abs = resolve(targetPath, safe);
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+
+    try {
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content, 'utf-8');
+      writtenFiles.push(safe);
+      return `OK: ${safe} written (${content.length} bytes)`;
+    } catch (e) {
+      return `Error writing ${safe}: ${e}`;
+    }
+  }
+
+  if (toolName === 'read_file') {
+    const filePath = String(input.path ?? '').trim();
+    const safe = filePath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    const abs = resolve(targetPath, safe);
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+    try {
+      if (!existsSync(abs)) return `Error: ${safe} does not exist`;
+      return readFileSync(abs, 'utf-8');
+    } catch (e) {
+      return `Error reading ${safe}: ${e}`;
+    }
+  }
+
+  return `Unknown tool: ${toolName}`;
+}
+
+// ── File writing helpers (regex fallback) ─────────────────────────────────
+
+/**
+ * Parse code blocks with file paths from LLM text response (fallback).
+ */
+function extractFiles(
+  content: string,
+  taskTitle?: string,
+): Array<{ path: string; code: string }> {
+  const files: Array<{ path: string; code: string }> = [];
+  let m: RegExpExecArray | null;
+
+  // Format 1: ## File: path  (heading before fence)
+  const headingPattern =
+    /(?:^|\n)#{1,3}\s+(?:File|파일|filename|path):\s*[`']?([^\n`']+)[`']?\n```[^\n]*\n([\s\S]*?)```/gi;
+  while ((m = headingPattern.exec(content)) !== null) {
+    files.push({ path: m[1].trim(), code: m[2] });
+  }
+
+  // Format 2: **`path/to/file`** or **path/to/file** before fence
+  const boldPathPattern =
+    /\*\*`?([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)`?\*\*\s*\n```[^\n]*\n([\s\S]*?)```/g;
+  while ((m = boldPathPattern.exec(content)) !== null) {
+    const filePath = m[1].trim();
+    if (!files.some((f) => f.path === filePath)) {
+      files.push({ path: filePath, code: m[2] });
+    }
+  }
+
+  // Format 3: ```lang:path/to/file  (inline path in fence)
+  const fenceWithPathPattern = /```[a-zA-Z0-9_-]+:([^\n]+)\n([\s\S]*?)```/g;
+  while ((m = fenceWithPathPattern.exec(content)) !== null) {
+    const filePath = m[1].trim();
+    if (!files.some((f) => f.path === filePath)) {
+      files.push({ path: filePath, code: m[2] });
+    }
+  }
+
+  // Format 4: // filename: path  or # filename: path  (comment inside fence)
+  const commentFilenamePattern = /```[^\n]*\n(?:\/\/|#)\s*(?:filename|file|path):\s*([^\n]+)\n([\s\S]*?)```/gi;
+  while ((m = commentFilenamePattern.exec(content)) !== null) {
+    const filePath = m[1].trim();
+    const code = m[2];
+    if (!files.some((f) => f.path === filePath)) {
+      files.push({ path: filePath, code });
+    }
+  }
+
+  // Format 5: Fallback — any code fence with identifiable extension
+  // Only use when no named files found, to avoid duplicates
+  if (files.length === 0) {
+    const anyFencePattern = /```([^\n]*)\n([\s\S]*?)```/g;
+    let idx = 0;
+    while ((m = anyFencePattern.exec(content)) !== null) {
+      const lang = m[1].trim().toLowerCase();
+      const code = m[2];
+      if (!code.trim() || !lang) continue;
+
+      // Derive extension from language hint
+      const extMap: Record<string, string> = {
+        typescript: 'ts', ts: 'ts', tsx: 'tsx',
+        javascript: 'js', js: 'js', jsx: 'jsx',
+        python: 'py', py: 'py',
+        bash: 'sh', sh: 'sh', shell: 'sh',
+        dockerfile: 'Dockerfile',
+        yaml: 'yaml', yml: 'yaml',
+        json: 'json',
+        css: 'css', scss: 'scss',
+        html: 'html',
+        sql: 'sql',
+        go: 'go', rust: 'rs', java: 'java',
+      };
+      const ext = extMap[lang] ?? lang;
+      if (!ext) continue;
+
+      // Derive base name from task title
+      const baseName = taskTitle
+        ? taskTitle
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+            .slice(0, 40)
+        : `output-${idx}`;
+
+      const filename = ext === 'Dockerfile' ? 'Dockerfile' : `${baseName}-${idx}.${ext}`;
+      files.push({ path: filename, code });
+      idx++;
+    }
+  }
+
+  return files;
+}
+
+function writeFiles(repoPath: string, files: Array<{ path: string; code: string }>): string[] {
+  const written: string[] = [];
+  for (const file of files) {
+    // Sanitize path: strip leading slashes / drive letters to prevent path traversal
+    const safePath = file.path.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    if (!safePath) continue;
+    const absPath = resolve(repoPath, safePath);
+    // Ensure it's within repoPath
+    if (!absPath.startsWith(resolve(repoPath))) continue;
+    try {
+      mkdirSync(dirname(absPath), { recursive: true });
+      writeFileSync(absPath, file.code, 'utf-8');
+      written.push(safePath);
+    } catch {
+      // ignore individual file write errors
+    }
+  }
+  return written;
+}
+
+/** Build system prompt that instructs agent to output files in parseable format */
+function buildAgentSystemPrompt(basePrompt: string | undefined, repoPath: string): string {
+  const fileInstruction = `IMPORTANT: You are a software development agent. Your primary output MUST be working code files.
+
+For EVERY task that involves creating, modifying, or configuring code:
+1. Output each file using EXACTLY this format:
+
+## File: relative/path/to/file.ext
+\`\`\`language
+(complete file content — never truncate)
+\`\`\`
+
+2. Use paths relative to the project root. Example: src/index.ts, Dockerfile, package.json
+3. Output ALL files required — do not skip any file
+4. After outputting all files, write a brief summary of what was implemented
+
+Project root: ${repoPath}
+
+DO NOT write prose guides or step-by-step instructions. Write actual code files.`;
+
+  return basePrompt ? `${fileInstruction}\n\n${basePrompt}` : fileInstruction;
+}
 
 function getDb(req: Request): ServerDatabase { return req.app.locals.db as ServerDatabase; }
 function getWss(req: Request): WebSocketManager | undefined { return req.app.locals.wss as WebSocketManager | undefined; }
@@ -294,7 +503,67 @@ function broadcastChatStatus(
   }
 }
 
-// ── Execute subtasks (with auto agent creation + chat progress) ──
+// ── PM Review ──────────────────────────────────────────────────────────────
+
+const PM_REVIEW_PROMPT = `You are a strict but fair Project Manager reviewing an agent's work.
+
+Task title: {TITLE}
+Task description: {DESCRIPTION}
+Agent's output:
+---
+{OUTPUT}
+---
+
+Evaluate whether the output adequately completes the task.
+- APPROVE if: the output contains concrete implementation (actual code, config, or files), is relevant to the task, and is reasonably complete.
+- REVISE if: the output is only a conceptual guide/explanation with no actual code, is clearly wrong, is empty, or is missing critical parts.
+
+Respond with ONLY this JSON (no markdown, no extra text):
+{"decision":"APPROVE","feedback":""}
+or
+{"decision":"REVISE","feedback":"Specific actionable instructions for the agent to fix the work."}`;
+
+async function pmReview(
+  chatFn: GatewayChatFn,
+  pmAgent: Agent,
+  subtask: { title: string; description: string },
+  agentOutput: string,
+): Promise<{ decision: 'APPROVE' | 'REVISE'; feedback: string }> {
+  const prompt = PM_REVIEW_PROMPT
+    .replace('{TITLE}', subtask.title)
+    .replace('{DESCRIPTION}', subtask.description)
+    .replace('{OUTPUT}', agentOutput.slice(0, 3000)); // cap to avoid huge prompts
+
+  try {
+    const response = await chatFn(
+      pmAgent.provider,
+      pmAgent.model,
+      [{ role: 'user', content: prompt }],
+    );
+
+    const raw = response.content.trim();
+    const jsonMatch = raw.match(/\{[\s\S]*?"decision"\s*:\s*"(APPROVE|REVISE)"[\s\S]*?\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        decision: parsed.decision === 'APPROVE' ? 'APPROVE' : 'REVISE',
+        feedback: typeof parsed.feedback === 'string' ? parsed.feedback : '',
+      };
+    }
+    // Fallback: if response mentions approve/ok, approve
+    if (/approve|승인|ok|good|완료/i.test(raw)) {
+      return { decision: 'APPROVE', feedback: '' };
+    }
+  } catch {
+    // PM review failed — approve to avoid infinite loop
+  }
+  return { decision: 'APPROVE', feedback: '' };
+}
+
+// ── Execute subtasks (PM review loop) ──────────────────────────────────────
+
+const MAX_REVIEW_CYCLES = 3;
+
 async function executeSubtasks(
   db: ServerDatabase,
   wss: WebSocketManager | undefined,
@@ -303,24 +572,24 @@ async function executeSubtasks(
   agents: Agent[],
   subtasks: Array<{ id: string; assigneeAgentId?: string; title: string; description: string }>,
   skillLoader?: SkillLoader,
-  pmName?: string,
+  pmAgent?: Agent,
   chatHistory?: Array<{ role: string; content: string; sender?: string; timestamp: string }>,
+  repoPath?: string,
 ): Promise<void> {
   const allSkills = skillLoader?.loadSkills() ?? [];
   const currentAgents = [...agents];
-  const pm = pmName ?? 'PM';
+  const pmName = pmAgent?.name ?? 'PM';
   const total = subtasks.length;
   let doneCount = 0;
   let failedCount = 0;
+  const targetPath = repoPath ?? process.cwd();
 
   for (let idx = 0; idx < subtasks.length; idx++) {
     const subtask = subtasks[idx];
     let agent = currentAgents.find((a) => a.id === subtask.assigneeAgentId);
 
-    // Auto-create agent if no assignee found
     if (!agent && subtask.assigneeAgentId) {
-      const intendedAgent = agents.find((a) => a.id === subtask.assigneeAgentId);
-      if (intendedAgent) agent = intendedAgent;
+      agent = agents.find((a) => a.id === subtask.assigneeAgentId);
     }
     if (!agent) {
       const matched = matchAgent(currentAgents, subtask);
@@ -333,16 +602,15 @@ async function executeSubtasks(
       await db.updateTask(subtask.id, { assigneeAgentId: agent.id });
     }
 
-    // Notify chat: task starting
     broadcastChatStatus(
       wss, projectId,
-      `[${idx + 1}/${total}] ${subtask.title} 시작 → ${agent.name}`,
-      pm, chatHistory,
+      `[${idx + 1}/${total}] **${subtask.title}** 시작 → ${agent.name}`,
+      pmName, chatHistory,
     );
 
     try {
-      const updated = await db.updateAgent(agent.id, { visualState: AgentVisualState.WORKING });
-      broadcastAgentUpdate(wss, projectId, updated);
+      const agentUpdated = await db.updateAgent(agent.id, { visualState: AgentVisualState.WORKING });
+      broadcastAgentUpdate(wss, projectId, agentUpdated);
 
       const inProgress = await db.updateTask(subtask.id, { status: TaskStatus.IN_PROGRESS });
       broadcastTaskUpdate(wss, projectId, inProgress);
@@ -350,35 +618,158 @@ async function executeSubtasks(
       const selectedSkills = skillLoader
         ? skillLoader.selectSkills(allSkills, agent.role, subtask.description)
         : [];
-
       const chatOptions = selectedSkills.length > 0
         ? { tools: selectedSkills, tool_choice: 'auto' as const }
         : undefined;
 
-      const response = await chatFn(
-        agent.provider,
-        agent.model,
-        [{ role: 'user', content: subtask.description }],
-        agent.systemPrompt,
-        chatOptions,
-      );
+      const effectiveSystemPrompt = agent.systemPrompt
+        ? `${agent.systemPrompt}\n\nIMPORTANT: Use the write_file tool to create ALL files. Do not output code in text.`
+        : 'IMPORTANT: Use the write_file tool to create ALL files. Do not output code in text — call write_file for each file.';
 
-      const done = await db.updateTask(subtask.id, { status: TaskStatus.DONE, result: response.content });
+      // ── Agentic tool execution loop ─────────────────────────────
+      // Each "round" = one LLM call + all resulting tool executions
+      const writtenFiles: string[] = [];
+      let lastResponse = '';
+      let approved = false;
+      let reviewCycle = 0;
+
+      // Build initial user message
+      let currentUserMsg = subtask.description;
+
+      while (!approved && reviewCycle < MAX_REVIEW_CYCLES) {
+        const agentMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
+          { role: 'user', content: currentUserMsg },
+        ];
+
+        // ── Inner tool execution loop ──────────────────────────
+        // The agent may need multiple turns to call all write_file tools
+        const TOOL_LOOP_LIMIT = 8;
+        let toolLoopCount = 0;
+        let roundWritten: string[] = [];
+
+        while (toolLoopCount < TOOL_LOOP_LIMIT) {
+          const toolsForAgent = [...FILE_TOOLS, ...(selectedSkills ?? [])];
+          let response: ExtendedChatResponse | Awaited<ReturnType<GatewayChatFn>>;
+          try {
+            response = await chatFn(
+              agent.provider,
+              agent.model,
+              agentMessages,
+              effectiveSystemPrompt,
+              { tools: toolsForAgent, tool_choice: 'auto' },
+            );
+          } catch (toolErr) {
+            // Model doesn't support tools — fall back to text
+            if (/does not support tools|tool.*not.*support|function.*call|tools.*not.*supported/i.test(String(toolErr))) {
+              response = await chatFn(
+                agent.provider,
+                agent.model,
+                agentMessages,
+                effectiveSystemPrompt,
+              );
+            } else {
+              throw toolErr;
+            }
+          }
+
+          lastResponse = response.content ?? '';
+
+          // Execute tool calls
+          const toolUse = (response as ExtendedChatResponse).toolUse;
+          if (toolUse && toolUse.length > 0) {
+            const toolResults: string[] = [];
+            for (const tool of toolUse) {
+              const result = executeToolCall(tool.name, tool.input, targetPath, roundWritten);
+              toolResults.push(`[${tool.name}(${JSON.stringify(tool.input.path ?? tool.input)})] → ${result}`);
+            }
+            writtenFiles.push(...roundWritten);
+
+            // Feed results back to agent (text-based tool result — works with all providers)
+            agentMessages.push({ role: 'assistant', content: lastResponse || '(tool calls executed)' });
+            agentMessages.push({
+              role: 'user',
+              content: `Tool execution results:\n${toolResults.join('\n')}\n\nContinue if more files needed, or respond "done" when complete.`,
+            });
+            toolLoopCount++;
+          } else {
+            // No tool calls — agent is done with this round
+            break;
+          }
+        }
+        // ── End inner tool loop ────────────────────────────────
+
+        // Regex fallback: if no files written via tools, try to parse text
+        if (writtenFiles.length === 0 && lastResponse.length > 50) {
+          const textFiles = extractFiles(lastResponse, subtask.title);
+          writtenFiles.push(...writeFiles(targetPath, textFiles));
+        }
+
+        // ── PM review ─────────────────────────────────────────
+        if (pmAgent && reviewCycle < MAX_REVIEW_CYCLES - 1) {
+          const pmWorking = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.WORKING });
+          broadcastAgentUpdate(wss, projectId, pmWorking);
+
+          broadcastChatStatus(
+            wss, projectId,
+            `🔍 [검토 ${reviewCycle + 1}/${MAX_REVIEW_CYCLES}] ${agent.name}의 작업을 검토 중...`,
+            pmName, chatHistory,
+          );
+
+          // PM reviews based on written files list + agent response
+          const reviewContext = writtenFiles.length > 0
+            ? `작성된 파일: ${writtenFiles.join(', ')}\n\n에이전트 응답:\n${lastResponse.slice(0, 1500)}`
+            : `에이전트 응답 (파일 없음):\n${lastResponse.slice(0, 1500)}`;
+
+          const review = await pmReview(chatFn, pmAgent, subtask, reviewContext);
+
+          const pmIdle = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.IDLE });
+          broadcastAgentUpdate(wss, projectId, pmIdle);
+
+          if (review.decision === 'APPROVE') {
+            approved = true;
+            broadcastChatStatus(
+              wss, projectId,
+              `✅ 승인: **${subtask.title}** (${agent.name})`,
+              pmName, chatHistory,
+            );
+          } else {
+            reviewCycle++;
+            broadcastChatStatus(
+              wss, projectId,
+              `🔄 보완 요청 [${reviewCycle}/${MAX_REVIEW_CYCLES}] → ${agent.name}\n${review.feedback}`,
+              pmName, chatHistory,
+            );
+            // New round: tell agent what to fix, referencing existing files
+            const existingFilesList = writtenFiles.length > 0
+              ? `\n\n현재 작성된 파일: ${writtenFiles.join(', ')}`
+              : '';
+            currentUserMsg = `[PM 피드백]${existingFilesList}\n\n${review.feedback}\n\nwrite_file 툴로 필요한 파일을 수정하거나 추가하세요.`;
+          }
+        } else {
+          approved = true;
+        }
+        // ── End PM review ──────────────────────────────────────
+      }
+      // ── End PM review loop ───────────────────────────────────
+
+      const done = await db.updateTask(subtask.id, { status: TaskStatus.DONE, result: lastResponse });
       broadcastTaskUpdate(wss, projectId, done);
 
       const idle = await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE });
       broadcastAgentUpdate(wss, projectId, idle);
 
       doneCount++;
-      // Notify chat: task completed
-      const preview = response.content.length > 80
-        ? response.content.slice(0, 80) + '...'
-        : response.content;
+
+      const preview = lastResponse.length > 120 ? lastResponse.slice(0, 120) + '...' : lastResponse;
+      const filesSummary = writtenFiles.length > 0
+        ? `\n📁 파일 저장: ${writtenFiles.join(', ')}`
+        : '';
       broadcastChatStatus(
         wss, projectId,
-        `✓ ${subtask.title} 완료 (${agent.name})\n${preview}`,
-        pm, chatHistory,
+        `✓ **${subtask.title}** 완료 (${agent.name})${filesSummary}`,
+        pmName, chatHistory,
       );
+
     } catch (err) {
       const failed = await db.updateTask(subtask.id, { status: TaskStatus.FAILED, error: String(err) });
       broadcastTaskUpdate(wss, projectId, failed);
@@ -387,21 +778,135 @@ async function executeSubtasks(
       broadcastAgentUpdate(wss, projectId, idle);
 
       failedCount++;
-      // Notify chat: task failed
       const errMsg = String(err).length > 100 ? String(err).slice(0, 100) + '...' : String(err);
       broadcastChatStatus(
         wss, projectId,
-        `✗ ${subtask.title} 실패 (${agent.name})\n${errMsg}`,
-        pm, chatHistory,
+        `✗ **${subtask.title}** 실패 (${agent.name})\n${errMsg}`,
+        pmName, chatHistory,
       );
     }
   }
 
-  // Final summary
   const summary = failedCount > 0
     ? `전체 작업 완료: ${doneCount}/${total} 성공, ${failedCount}/${total} 실패`
-    : `전체 ${total}개 작업이 모두 성공적으로 완료되었습니다.`;
-  broadcastChatStatus(wss, projectId, summary, pm, chatHistory);
+    : `🎉 전체 ${total}개 작업이 모두 완료되었습니다.`;
+  broadcastChatStatus(wss, projectId, summary, pmName, chatHistory);
+
+  // ── Final PM review: check for missing files + generate HOW_TO_RUN.md ──
+  if (pmAgent) {
+    try {
+      await finalizeProject(
+        chatFn, pmAgent, targetPath, db, wss, projectId, pmName, chatHistory,
+      );
+    } catch { /* non-critical */ }
+  }
+}
+
+// ── Project finalization (PM final check + HOW_TO_RUN.md) ──────────────────
+
+async function finalizeProject(
+  chatFn: GatewayChatFn,
+  pmAgent: Agent,
+  targetPath: string,
+  db: ServerDatabase,
+  wss: WebSocketManager | undefined,
+  projectId: string,
+  pmName: string,
+  chatHistory?: Array<{ role: string; content: string; sender?: string; timestamp: string }>,
+): Promise<void> {
+  // Collect all files written to the project directory
+  const allFiles = collectProjectFiles(targetPath);
+  if (allFiles.length === 0) return;
+
+  broadcastChatStatus(wss, projectId,
+    `🔎 PM이 생성된 파일을 검토하고 실행 가이드를 작성합니다...`,
+    pmName, chatHistory,
+  );
+
+  const pmWorking = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.WORKING });
+  broadcastAgentUpdate(wss, pmAgent.projectId ?? projectId, pmWorking);
+
+  const finalizationPrompt = `You are a project manager. The development team has completed their work.
+
+Project directory: ${targetPath}
+Generated files:
+${allFiles.map((f) => `  - ${f}`).join('\n')}
+
+Your tasks:
+1. Review the file list and identify any CRITICAL missing files needed to run the project (e.g., package.json, index.html, main entry point, tsconfig.json, vite.config.ts, etc.)
+2. Use write_file to create any missing critical files with sensible defaults
+3. Write a HOW_TO_RUN.md file that explains:
+   - What was built
+   - Prerequisites (Node.js version, etc.)
+   - Installation steps (npm install, etc.)
+   - How to run in development mode
+   - How to build for production
+   - File structure overview
+
+Be concrete and specific. Base the guide on the actual files that exist.`;
+
+  const writtenExtra: string[] = [];
+  try {
+    const response = await chatFn(
+      pmAgent.provider,
+      pmAgent.model,
+      [{ role: 'user', content: finalizationPrompt }],
+      'You are a helpful project manager. Use write_file for each file you create.',
+      { tools: FILE_TOOLS, tool_choice: 'auto' },
+    );
+
+    const toolUse = (response as ExtendedChatResponse).toolUse;
+    if (toolUse && toolUse.length > 0) {
+      for (const tool of toolUse) {
+        executeToolCall(tool.name, tool.input, targetPath, writtenExtra);
+      }
+    }
+
+    // If HOW_TO_RUN.md not created via tool, extract from text
+    const howToRunExists = allFiles.some((f) => /HOW_TO_RUN|README/i.test(f)) ||
+      writtenExtra.some((f) => /HOW_TO_RUN|README/i.test(f));
+    if (!howToRunExists && response.content && response.content.length > 100) {
+      // PM wrote the guide as text — save it
+      const guideFiles = extractFiles(response.content);
+      writeFiles(targetPath, guideFiles);
+      if (guideFiles.length === 0) {
+        // Just save the raw response as HOW_TO_RUN.md
+        writeFiles(targetPath, [{ path: 'HOW_TO_RUN.md', code: response.content }]);
+        writtenExtra.push('HOW_TO_RUN.md');
+      }
+    }
+
+    const finalMsg = writtenExtra.length > 0
+      ? `📋 PM 최종 검토 완료\n추가 파일: ${writtenExtra.join(', ')}\n\n프로젝트 실행 방법은 **HOW_TO_RUN.md**를 확인하세요.`
+      : `📋 PM 최종 검토 완료 — 프로젝트 구조가 완성되었습니다.\n실행 가이드: **HOW_TO_RUN.md**`;
+
+    broadcastChatStatus(wss, projectId, finalMsg, pmName, chatHistory);
+  } finally {
+    const pmIdle = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.IDLE });
+    broadcastAgentUpdate(wss, pmAgent.projectId ?? projectId, pmIdle);
+  }
+}
+
+/** Collect all files in the project directory (excluding node_modules, .git, dist, etc.) */
+function collectProjectFiles(dir: string, rel = ''): string[] {
+  const IGNORE = new Set(['node_modules', '.git', 'dist', '.next', '.nuxt', '__pycache__', '.mct-madev']);
+  const results: string[] = [];
+  let entries: string[];
+  try { entries = readdirSync(dir); } catch { return results; }
+
+  for (const entry of entries) {
+    if (IGNORE.has(entry) || entry.startsWith('.')) continue;
+    const full = join(dir, entry);
+    const relPath = rel ? `${rel}/${entry}` : entry;
+    try {
+      if (statSync(full).isDirectory()) {
+        results.push(...collectProjectFiles(full, relPath));
+      } else {
+        results.push(relPath);
+      }
+    } catch { /* skip */ }
+  }
+  return results;
 }
 
 // ── Router ──
@@ -559,7 +1064,9 @@ export function createChatRouter(): Router {
 
         // Execute asynchronously
         const skillLoader = getSkillLoader(req);
-        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent.name, history).catch(() => {});
+        const project = await db.getProject(projectId);
+        const repoPath = project?.repoPath;
+        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, repoPath).catch(() => {});
       }
 
       // PM back to idle
@@ -587,7 +1094,17 @@ export function createChatRouter(): Router {
         },
       });
     } catch (err) {
-      res.status(500).json({ error: 'Chat failed', detail: String(err) });
+      const detail = String(err);
+      // Provide a human-readable hint for common errors
+      let hint = '';
+      if (/401|unauthorized|invalid.*api.*key|api.*key.*invalid/i.test(detail)) {
+        hint = ' (API 키가 유효하지 않습니다. .env를 확인하고 서버를 재시작하세요.)';
+      } else if (/no.*provider|provider.*not.*found|not.*registered/i.test(detail)) {
+        hint = ' (AI 프로바이더가 설정되지 않았습니다. .env에 API 키를 추가하세요.)';
+      } else if (/econnrefused|network|fetch/i.test(detail)) {
+        hint = ' (네트워크 오류. Ollama나 외부 API 서버를 확인하세요.)';
+      }
+      res.status(500).json({ error: `Chat failed${hint}`, detail });
     }
   });
 

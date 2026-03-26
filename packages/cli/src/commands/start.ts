@@ -132,7 +132,37 @@ export async function startCommand(options: StartOptions) {
     });
     console.log(chalk.dim('  ✓ Orchestrator initialized'));
 
-    // 6. Create server with all dependencies
+    // 6. Kill any existing process on the port before creating the server
+    {
+      const { execSync } = await import('node:child_process');
+      try {
+        let occupied = false;
+        if (process.platform === 'win32') {
+          const result = execSync(
+            `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"`,
+            { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+          ).trim();
+          if (result) {
+            occupied = true;
+            const pids = [...new Set(result.split(/\s+/).filter(Boolean))];
+            for (const pid of pids) {
+              execSync(`taskkill /PID ${pid} /F`, { stdio: 'ignore' });
+            }
+          }
+        } else {
+          try {
+            execSync(`lsof -ti tcp:${port} | xargs kill -9`, { stdio: 'ignore' });
+            occupied = true;
+          } catch { /* port was free */ }
+        }
+        if (occupied) {
+          console.log(chalk.yellow(`  ⚠ Killed existing process on port ${port}`));
+          await new Promise((r) => setTimeout(r, 800));
+        }
+      } catch { /* ignore */ }
+    }
+
+    // 7. Create server with all dependencies
     const staticDir = findWebDist();
     if (staticDir) {
       console.log(chalk.dim(`  ✓ Serving UI from ${staticDir}`));
@@ -147,12 +177,12 @@ export async function startCommand(options: StartOptions) {
       skillLoader,
     });
 
-    // 7. Setup event bridge (orchestrator events → WS clients)
+    // 8. Setup event bridge (orchestrator events → WS clients)
     createEventBridge(emitter, instance.wss, db);
     setupSubscribeSync(instance.wss, db);
     console.log(chalk.dim('  ✓ Event bridge connected'));
 
-    // 8. Start listening
+    // 9. Start listening
     const { port: actualPort } = await instance.listen(port);
     const url = `http://localhost:${actualPort}`;
 

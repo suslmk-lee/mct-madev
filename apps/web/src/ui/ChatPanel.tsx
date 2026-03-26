@@ -173,10 +173,12 @@ export function ChatPanel() {
         body: JSON.stringify({ message }),
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
+        const err = await res.json().catch(() => ({})) as Record<string, string>;
+        const errMsg = err.error ?? 'Failed to send';
+        const detail = err.detail ? `\n${err.detail}` : '';
         addChatMessage({
           role: 'assistant',
-          content: `Error: ${(err as Record<string, string>).error ?? 'Failed to send'}`,
+          content: `Error: ${errMsg}${detail}`,
           sender: 'System',
           timestamp: new Date().toISOString(),
         });

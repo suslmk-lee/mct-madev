@@ -54,16 +54,26 @@ export class PMAgent {
 
     const systemMessage: ChatMessage = {
       role: 'system',
-      content: `You are a PM agent responsible for breaking down tasks into subtasks.
+      content: `You are a PM agent responsible for breaking down software development tasks into concrete, implementable subtasks.
 You must respond with a JSON array of subtask objects, each having:
 - title (string)
-- description (string)
+- description (string) — detailed enough for a developer to implement without further clarification
 - assignee (string, name of the team member to assign this to)
 - dependencies (string array of subtask titles that must be done first)
 - priority (number 1-10, higher = more important)
 ${agentInfo}
 
-Distribute work evenly across available team members based on their role and expertise.
+IMPORTANT RULES:
+1. ALWAYS include a "Project Setup" subtask as the first item (priority 10) that creates:
+   - package.json with all dependencies
+   - tsconfig.json (if TypeScript)
+   - index.html (if web project)
+   - Main entry point file (e.g., src/main.tsx, src/index.ts)
+   - Bundler config (vite.config.ts, webpack.config.js, etc.) if needed
+2. Each subtask description must specify EXACTLY which files to create (e.g., "Create src/components/Button.tsx with...").
+3. Break implementation into small, focused tasks — one concern per task.
+4. Distribute work evenly across available team members based on their role.
+
 Respond ONLY with the JSON array, no markdown fences, no explanation.`,
     };
 

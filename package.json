@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "description": "Multi-Agent Orchestration System with 3D Office UI",
   "scripts": {
-    "build": "pnpm -r build",
+    "setup": "pnpm install; node scripts/fix-workspace-links.mjs",
+    "build": "pnpm -r build && node scripts/sync-workspace-dists.mjs",
     "dev": "pnpm -r --parallel dev",
     "test": "pnpm -r test",
     "lint": "biome check .",

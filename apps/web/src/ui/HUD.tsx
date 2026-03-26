@@ -12,6 +12,8 @@ export function HUD() {
   const loadProjects = useStore((s) => s.loadProjects);
   const setAgentPanelMode = useStore((s) => s.setAgentPanelMode);
   const setSelectedAgentId = useStore((s) => s.setSelectedAgentId);
+  const cameraPreset = useStore((s) => s.cameraPreset);
+  const setCameraPreset = useStore((s) => s.setCameraPreset);
 
   const statusColor = projectStatus === 'ACTIVE' ? '#44CC66' : projectStatus === 'SUSPENDED' ? '#ffaa44' : projectStatus === 'CLOSED' ? '#888' : '#44CC66';
   const statusLabel = projectStatus === 'SUSPENDED' ? '일시중지' : projectStatus === 'CLOSED' ? '종료' : '';
@@ -133,6 +135,75 @@ export function HUD() {
             'linear-gradient(90deg, transparent, rgba(68,136,255,0.4), rgba(68,204,102,0.4), rgba(255,136,68,0.4), transparent)',
         }}
       />
+
+      {/* Camera preset bar - bottom center */}
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 16,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          pointerEvents: 'auto',
+          display: 'flex',
+          gap: 4,
+          padding: '4px 6px',
+          background: 'rgba(10, 15, 30, 0.65)',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          borderRadius: 10,
+          borderTop: '1px solid rgba(68, 136, 255, 0.25)',
+          border: '1px solid rgba(255, 255, 255, 0.08)',
+          boxShadow: '0 0 12px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(68, 136, 255, 0.15)',
+        }}
+      >
+        {([
+          ['overview', '전체'],
+          ['ceo', 'CEO'],
+          ['pm', 'PM'],
+          ['dev', 'Dev'],
+          ['warroom', '회의실'],
+          ['breakroom', '휴게실'],
+        ] as const).map(([key, label]) => {
+          const active = cameraPreset === key;
+          return (
+            <button
+              key={key}
+              onClick={() => setCameraPreset(key)}
+              style={{
+                fontSize: 11,
+                padding: '4px 12px',
+                borderRadius: 6,
+                border: 'none',
+                cursor: 'pointer',
+                fontWeight: active ? 600 : 400,
+                color: active ? '#ddeeff' : 'rgba(255,255,255,0.45)',
+                background: active
+                  ? 'rgba(68,136,255,0.3)'
+                  : 'rgba(255,255,255,0.04)',
+                boxShadow: active
+                  ? '0 0 8px rgba(68,136,255,0.3), inset 0 0 4px rgba(68,136,255,0.15)'
+                  : 'none',
+                transition: 'all 0.15s ease',
+                whiteSpace: 'nowrap',
+              }}
+              onMouseOver={(e) => {
+                if (!active) {
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.1)';
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.7)';
+                }
+              }}
+              onMouseOut={(e) => {
+                if (!active) {
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.45)';
+                }
+              }}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

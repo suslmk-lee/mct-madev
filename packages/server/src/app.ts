@@ -79,6 +79,12 @@ export function createApp(options: AppOptions = {}): express.Express {
     });
   });
 
+  // --- Shutdown endpoint ---
+  app.post('/api/shutdown', (_req: Request, res: Response) => {
+    res.json({ message: 'Shutting down...' });
+    setTimeout(() => process.exit(0), 200);
+  });
+
   // --- API routes ---
   app.use('/api', createApiRouter());
 
