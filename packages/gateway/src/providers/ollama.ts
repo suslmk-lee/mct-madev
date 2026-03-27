@@ -36,7 +36,7 @@ export class OllamaProvider implements IProvider {
   async chat(messages: ChatMessage[], config: ModelConfig, options?: ChatOptions): Promise<ChatResponse | ExtendedChatResponse> {
     const ollamaMessages: OllamaMessage[] = messages.map((m) => ({
       role: m.role,
-      content: m.content,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
     }));
 
     const body: Record<string, unknown> = {
@@ -77,7 +77,8 @@ export class OllamaProvider implements IProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Ollama API error (${response.status}): ${errorText}`);
+      const safeError = errorText.slice(0, 500);
+      throw new Error(`Ollama API error (${response.status}): ${safeError}`);
     }
 
     const data = (await response.json()) as OllamaResponse;

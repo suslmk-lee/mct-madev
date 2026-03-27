@@ -29,9 +29,10 @@ export function StatusLog() {
   // Auto-open panel when new events arrive (if closed)
   useEffect(() => {
     if (logEntries.length > prevLengthRef.current && !logOpen) {
-      // Auto-open on first real activity
+      // Auto-open on first real activity (unless user disabled auto-open)
       if (logEntries.length >= 1 && prevLengthRef.current === 0) {
-        setLogOpen(true);
+        const autoOpen = localStorage.getItem('mct-log-auto-open') !== 'false';
+        if (autoOpen) setLogOpen(true);
       }
     }
     prevLengthRef.current = logEntries.length;
@@ -172,30 +173,60 @@ export function StatusLog() {
                 {logEntries.length} entries
               </span>
             </div>
-            <button
-              onClick={clearLog}
-              style={{
-                fontSize: 10,
-                color: 'rgba(255,255,255,0.25)',
-                background: 'rgba(255,255,255,0.04)',
-                border: '1px solid rgba(255,255,255,0.06)',
-                borderRadius: 6,
-                padding: '3px 8px',
-                cursor: 'pointer',
-                fontFamily: 'inherit',
-                transition: 'all 0.2s',
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.5)';
-                (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.25)';
-                (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
-              }}
-            >
-              Clear
-            </button>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button
+                onClick={() => {
+                  const current = localStorage.getItem('mct-log-auto-open') !== 'false';
+                  localStorage.setItem('mct-log-auto-open', String(!current));
+                }}
+                title="자동 열림 설정"
+                style={{
+                  fontSize: 12,
+                  color: 'rgba(255,255,255,0.25)',
+                  background: 'rgba(255,255,255,0.04)',
+                  border: '1px solid rgba(255,255,255,0.06)',
+                  borderRadius: 6,
+                  padding: '3px 6px',
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                  transition: 'all 0.2s',
+                }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.5)';
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.25)';
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
+                }}
+              >
+                {localStorage.getItem('mct-log-auto-open') !== 'false' ? '🔔' : '🔕'}
+              </button>
+              <button
+                onClick={clearLog}
+                style={{
+                  fontSize: 10,
+                  color: 'rgba(255,255,255,0.25)',
+                  background: 'rgba(255,255,255,0.04)',
+                  border: '1px solid rgba(255,255,255,0.06)',
+                  borderRadius: 6,
+                  padding: '3px 8px',
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                  transition: 'all 0.2s',
+                }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.5)';
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.25)';
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)';
+                }}
+              >
+                Clear
+              </button>
+            </div>
           </div>
 
           {/* Log entries */}
@@ -266,9 +297,8 @@ export function StatusLog() {
                           lineHeight: 1.4,
                           marginTop: 2,
                           wordBreak: 'break-all',
-                          maxHeight: 60,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
+                          maxHeight: entry.level === 'error' ? 'none' : 60,
+                          overflow: entry.level === 'error' ? 'visible' : 'hidden',
                         }}>
                           {entry.detail}
                         </div>

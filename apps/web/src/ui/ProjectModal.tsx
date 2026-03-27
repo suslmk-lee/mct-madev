@@ -45,21 +45,23 @@ export function ProjectModal() {
   if (!open) return null;
 
   const handleCreate = async () => {
-    if (!name.trim() || !repoPath.trim()) return;
+    if (!name.trim()) return;
     setCreating(true);
     setFeedback(null);
     const result = await createProject({
       name: name.trim(),
-      repoPath: repoPath.trim(),
+      repoPath: repoPath.trim() || undefined,
       description: desc.trim() || undefined,
       teamPreset: preset,
     });
     setCreating(false);
-    if (result) {
+    if (result && 'id' in result) {
       setFeedback({ type: 'success', message: `프로젝트 '${name.trim()}' 생성 완료` });
       setName('');
       setRepoPath('');
       setDesc('');
+    } else if (result && 'error' in result) {
+      setFeedback({ type: 'error', message: result.error });
     } else {
       setFeedback({ type: 'error', message: '프로젝트 생성 실패. 서버 연결을 확인하세요.' });
     }
@@ -287,11 +289,11 @@ export function ProjectModal() {
             />
 
             {/* Workspace Path */}
-            <FieldLabel label="워크스페이스 경로" required />
+            <FieldLabel label="워크스페이스 경로" />
             <input
               value={repoPath}
               onChange={(e) => setRepoPath(e.target.value)}
-              placeholder="D:\workspace\my-project"
+              placeholder="비워두면 ~/mct-madev-projects/{이름} 자동 생성"
               style={{ ...inputStyle, fontFamily: 'monospace' }}
             />
 
@@ -366,12 +368,12 @@ export function ProjectModal() {
               </button>
               <button
                 onClick={handleCreate}
-                disabled={!name.trim() || !repoPath.trim() || creating}
+                disabled={!name.trim() || creating}
                 style={{
                   padding: '8px 24px', borderRadius: 8,
-                  background: name.trim() && repoPath.trim() && !creating ? '#4488FF' : 'rgba(68,136,255,0.3)',
+                  background: name.trim() && !creating ? '#4488FF' : 'rgba(68,136,255,0.3)',
                   border: 'none', color: '#fff', fontSize: 13, fontWeight: 500,
-                  cursor: name.trim() && repoPath.trim() && !creating ? 'pointer' : 'not-allowed',
+                  cursor: name.trim() && !creating ? 'pointer' : 'not-allowed',
                   transition: 'all 0.2s',
                 }}
               >

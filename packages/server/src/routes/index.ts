@@ -6,12 +6,20 @@ import { createWorkflowsRouter } from './workflows.js';
 import { createMetricsRouter } from './metrics.js';
 import { createDirectiveRouter } from './directive.js';
 import { createChatRouter } from './chat.js';
+import { createFilesRouter } from './files.js';
+import { createProvidersRouter } from './providers.js';
 
 export function createApiRouter(): Router {
   const router = Router();
 
   // Project routes
   router.use('/projects', createProjectsRouter());
+
+  // File browser (nested under projects)
+  router.use('/projects/:projectId/files', createFilesRouter());
+
+  // Provider status
+  router.use('/providers', createProvidersRouter());
 
   // Agent routes (nested under projects + direct)
   const agentsRouter = createAgentsRouter();
@@ -47,3 +55,5 @@ export { createWorkflowsRouter } from './workflows.js';
 export { createMetricsRouter } from './metrics.js';
 export { createDirectiveRouter } from './directive.js';
 export { createChatRouter } from './chat.js';
+export { createFilesRouter } from './files.js';
+export { createProvidersRouter } from './providers.js';

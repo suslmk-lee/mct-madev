@@ -34,7 +34,12 @@ export interface ServerDatabase {
     status?: TaskStatus;
     assigneeAgentId?: string;
     workflowId?: string;
-  }): Promise<Task[]>;
+  }, pagination?: { limit?: number; offset?: number }): Promise<Task[]>;
+  countTasks(projectId: string, filters?: {
+    status?: TaskStatus;
+    assigneeAgentId?: string;
+    workflowId?: string;
+  }): Promise<number>;
   updateTask(id: string, data: Partial<Omit<Task, 'id' | 'projectId' | 'createdAt'>>): Promise<Task>;
 
   // Workflows
@@ -50,4 +55,24 @@ export interface ServerDatabase {
     byProvider: Record<string, { input: number; output: number }>;
     byAgent: Record<string, { input: number; output: number }>;
   }>;
+
+  // Tool call logging (optional)
+  logToolCall?(entry: {
+    taskId: string;
+    agentId: string;
+    toolName: string;
+    input: Record<string, unknown>;
+    result: string;
+    isError: boolean;
+  }): Promise<unknown>;
+  getToolCalls?(taskId: string): Promise<Array<{
+    id: string;
+    taskId: string;
+    agentId: string;
+    toolName: string;
+    input: Record<string, unknown>;
+    result: string;
+    isError: boolean;
+    createdAt: string;
+  }>>;
 }

@@ -25,7 +25,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
   // Create HTTP server first so we can attach WebSocket
   const tempApp = createApp({ staticDir: options.staticDir, corsOrigin: options.corsOrigin });
   const server = createHttpServer(tempApp);
-  const wss = createWebSocketServer(server);
+  const wss = createWebSocketServer(server, options.db);
 
   // Now create the real app with db and wss injected
   const app = createApp({ ...options, wss });

@@ -92,7 +92,7 @@ interface AppStore {
   setCurrentProjectId: (id: string | null) => void;
   setProjectModalOpen: (open: boolean, mode?: 'list' | 'create') => void;
   loadProjects: () => Promise<void>;
-  createProject: (data: { name: string; repoPath: string; description?: string; teamPreset?: string; config?: Record<string, unknown> }) => Promise<string | null>;
+  createProject: (data: { name: string; repoPath?: string; description?: string; teamPreset?: string; config?: Record<string, unknown> }) => Promise<{ id: string } | { error: string } | null>;
   suspendProject: () => Promise<void>;
   closeProject: () => Promise<void>;
   resumeProject: (id: string) => Promise<void>;
@@ -139,12 +139,21 @@ interface AppStore {
   selectedAgentId: string | null;
   setSelectedAgentId: (id: string | null) => void;
 
+  // Streaming thinking text per agent (agentId -> accumulated text)
+  agentThinking: Record<string, string>;
+  appendAgentThinking: (agentId: string, chunk: string) => void;
+  clearAgentThinking: (agentId: string) => void;
+
   // Time
   currentHour: number;
   setCurrentHour: (h: number) => void;
 
   // Data loading
   loadProject: (projectId: string) => Promise<void>;
+
+  // API error state (set when backend is unreachable or returns errors)
+  apiError: string | null;
+  setApiError: (err: string | null) => void;
 }
 
 // Default demo agents placed in their respective rooms
@@ -185,9 +194,13 @@ export const useStore = create<AppStore>((set) => ({
   loadProjects: async () => {
     try {
       const res = await fetch(`${API_BASE}/projects`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        set({ apiError: `서버 오류 (${res.status}): 프로젝트 목록을 불러오지 못했습니다.` });
+        return;
+      }
       const data = await res.json();
       set({
+        apiError: null,
         projects: (data.data ?? []).map((p: Record<string, unknown>) => ({
           id: p.id as string,
           name: p.name as string,
@@ -196,7 +209,9 @@ export const useStore = create<AppStore>((set) => ({
           repoPath: p.repoPath as string | undefined,
         })),
       });
-    } catch { /* ignore */ }
+    } catch {
+      set({ apiError: '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.' });
+    }
   },
 
   createProject: async (data) => {
@@ -220,23 +235,20 @@ export const useStore = create<AppStore>((set) => ({
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        console.error('[createProject] API error:', res.status, errData);
-        return null;
+        const msg = errData?.hint
+          ? `${errData.message ?? '생성 실패'}\n${errData.hint}`
+          : (errData?.error ?? `서버 오류 (${res.status})`);
+        return { error: msg };
       }
       const result = await res.json();
       const projectId = result.data?.id as string;
-      if (!projectId) {
-        console.error('[createProject] No project ID returned');
-        return null;
-      }
-      // Reload projects list and load the new project
+      if (!projectId) return { error: '서버가 프로젝트 ID를 반환하지 않았습니다.' };
       await useStore.getState().loadProjects();
       await useStore.getState().loadProject(projectId);
       set({ projectModalOpen: false });
-      return projectId;
+      return { id: projectId };
     } catch (err) {
-      console.error('[createProject] error:', err);
-      return null;
+      return { error: `연결 오류: ${String(err)}` };
     }
   },
 
@@ -331,16 +343,15 @@ export const useStore = create<AppStore>((set) => ({
   setTasks: (tasks) => set({ tasks }),
   updateTask: (id, updates) =>
     set((state) => {
-      const exists = state.tasks.some((t) => t.id === id);
-      if (exists) {
-        return { tasks: state.tasks.map((t) => (t.id === id ? { ...t, ...updates } : t)) };
-      }
-      // Upsert: add new task if it doesn't exist
-      return { tasks: [...state.tasks, { id, title: '', status: 'CREATED' as TaskStatus, ...updates }] };
+      if (!state.tasks.some((t) => t.id === id)) return {};
+      return { tasks: state.tasks.map((t) => (t.id === id ? { ...t, ...updates } : t)) };
     }),
 
   chatMessages: [],
-  addChatMessage: (msg) => set((state) => ({ chatMessages: [...state.chatMessages, msg] })),
+  addChatMessage: (msg) => set((state) => {
+    const next = [...state.chatMessages, msg];
+    return { chatMessages: next.length > 200 ? next.slice(-200) : next };
+  }),
   setChatMessages: (msgs) => set({ chatMessages: msgs }),
   chatOpen: false,
   setChatOpen: (v) => set({ chatOpen: v }),
@@ -365,23 +376,42 @@ export const useStore = create<AppStore>((set) => ({
   logUnread: 0,
   resetLogUnread: () => set({ logUnread: 0 }),
 
-  cameraPreset: 'overview',
-  setCameraPreset: (preset) => set({ cameraPreset: preset, followAgentId: null }),
+  cameraPreset: (localStorage.getItem('mct-camera-preset') as AppStore['cameraPreset']) || 'overview',
+  setCameraPreset: (preset) => {
+    localStorage.setItem('mct-camera-preset', preset);
+    set({ cameraPreset: preset, followAgentId: null });
+  },
   followAgentId: null,
   setFollowAgentId: (id) => set({ followAgentId: id }),
 
   selectedAgentId: null,
   setSelectedAgentId: (id) => set({ selectedAgentId: id }),
 
+  agentThinking: {},
+  appendAgentThinking: (agentId, chunk) =>
+    set((state) => ({
+      agentThinking: {
+        ...state.agentThinking,
+        [agentId]: ((state.agentThinking[agentId] ?? '') + chunk).slice(-4000), // keep last 4000 chars
+      },
+    })),
+  clearAgentThinking: (agentId) =>
+    set((state) => {
+      const next = { ...state.agentThinking };
+      delete next[agentId];
+      return { agentThinking: next };
+    }),
+
   currentHour: new Date().getUTCHours() + 9, // KST
   setCurrentHour: (h) => set({ currentHour: h }),
 
   loadProject: async (projectId: string) => {
     try {
-      const [projectRes, agentsRes, tasksRes] = await Promise.all([
+      const [projectRes, agentsRes, tasksRes, historyRes] = await Promise.all([
         fetch(`${API_BASE}/projects/${projectId}`),
         fetch(`${API_BASE}/projects/${projectId}/agents`),
         fetch(`${API_BASE}/projects/${projectId}/tasks`),
+        fetch(`${API_BASE}/projects/${projectId}/chat/history`),
       ]);
 
       if (!agentsRes.ok || !tasksRes.ok) throw new Error('API error');
@@ -389,6 +419,7 @@ export const useStore = create<AppStore>((set) => ({
       const projectData = projectRes.ok ? await projectRes.json() : null;
       const agentsData = await agentsRes.json();
       const tasksData = await tasksRes.json();
+      const historyData = historyRes.ok ? await historyRes.json() : null;
 
       set({
         currentProjectId: projectId,
@@ -406,10 +437,16 @@ export const useStore = create<AppStore>((set) => ({
           error: t.error as string | undefined,
           parentTaskId: t.parentTaskId as string | undefined,
         })),
+        chatMessages: (historyData?.messages ?? []).map((m: Record<string, unknown>) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content as string,
+          sender: m.sender as string | undefined,
+          timestamp: m.timestamp as string,
+        })),
       });
     } catch {
-      // Fallback to demo data if API is unavailable
       set({
+        apiError: '프로젝트 데이터를 불러오지 못했습니다. 데모 데이터를 표시합니다.',
         currentProjectId: null,
         currentProjectName: null,
         currentRepoPath: null,
@@ -419,4 +456,7 @@ export const useStore = create<AppStore>((set) => ({
       });
     }
   },
+
+  apiError: null,
+  setApiError: (err) => set({ apiError: err }),
 }));

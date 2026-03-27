@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { sendError } from '../routeError.js';
 import type { ServerDatabase } from '../database.js';
 
 function getDb(req: Request): ServerDatabase {
@@ -51,7 +52,7 @@ export function createMetricsRouter(): Router {
         });
       }
     } catch (err) {
-      res.status(500).json({ error: 'Failed to get metrics', detail: String(err) });
+      sendError(res, 500, 'Failed to get metrics', err);
     }
   });
 

@@ -64,6 +64,8 @@ export interface ExtendedChatMessage {
 export interface ChatOptions {
   tools?: SkillDefinition[];
   tool_choice?: 'auto' | 'any' | { type: 'tool'; name: string };
+  /** Called with each streaming text chunk; presence enables streaming mode */
+  onChunk?: (chunk: string) => void;
 }
 
 /** Extended chat response that may include tool calls */

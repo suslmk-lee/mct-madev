@@ -45,9 +45,9 @@ const ROLES: AgentRole[] = ['PM', 'DEVELOPER', 'REVIEWER', 'TESTER', 'DEVOPS'];
 const PROVIDERS = ['anthropic', 'openai', 'google', 'ollama', 'kimi', 'minimax', 'glm'];
 
 const PROVIDER_MODELS: Record<string, string[]> = {
-  anthropic: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4', 'claude-sonnet-4-20250514'],
-  openai:    ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini', 'o1', 'o1-mini', 'o3-mini'],
-  google:    ['gemini-2.0-flash', 'gemini-2.0-pro', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+  anthropic: ['claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5-20251001', 'claude-sonnet-4-5', 'claude-sonnet-4-20250514'],
+  openai:    ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'o3-mini', 'o1', 'o1-mini'],
+  google:    ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
   ollama:    [],
   kimi:      ['moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k'],
   minimax:   ['abab6.5-chat', 'abab5.5-chat'],
@@ -314,6 +314,7 @@ export function AgentDetailPanel() {
   const agents = useStore((s) => s.agents);
   const tasks = useStore((s) => s.tasks);
   const setSelectedAgentId = useStore((s) => s.setSelectedAgentId);
+  const agentThinking = useStore((s) => selectedAgentId ? s.agentThinking[selectedAgentId] : undefined);
 
   const agent = agents.find((a) => a.id === selectedAgentId);
 
@@ -456,8 +457,29 @@ export function AgentDetailPanel() {
       {/* ── Body ── */}
       <div style={{ position: 'relative', zIndex: 1, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 12 }}>
 
-        {/* Activity feed for active states */}
-        {isActive && <ActivityFeed role={agent.role} />}
+        {/* Real-time LLM streaming output */}
+        {agentThinking && (
+          <div>
+            <div style={{ fontSize: 9, letterSpacing: 2, color: 'rgba(136,170,255,0.5)', fontWeight: 600, marginBottom: 4 }}>
+              THINKING
+            </div>
+            <div style={{
+              background: 'rgba(0,0,0,0.4)',
+              border: '1px solid rgba(136,170,255,0.2)',
+              borderRadius: 6, padding: '7px 10px',
+              fontFamily: 'monospace', fontSize: 10,
+              color: 'rgba(180,200,255,0.7)', lineHeight: 1.55,
+              maxHeight: 140, overflowY: 'auto',
+              wordBreak: 'break-word',
+            }}>
+              {agentThinking}
+              <span style={{ display: 'inline-block', width: 6, height: 10, background: 'rgba(136,170,255,0.7)', marginLeft: 2, animation: 'statusPulse 0.8s ease-in-out infinite', verticalAlign: 'middle' }} />
+            </div>
+          </div>
+        )}
+
+        {/* Activity feed for active states (shown when no streaming text yet) */}
+        {isActive && !agentThinking && <ActivityFeed role={agent.role} />}
 
         {/* Current Task */}
         {agentTask && (
@@ -742,10 +764,17 @@ function AgentAddForm() {
 /*  Agent Edit Form                                                     */
 /* ------------------------------------------------------------------ */
 
-function AgentEditForm({ agent }: { agent: { id: string; name: string; role: string; provider?: string; model?: string; systemPrompt?: string } }) {
+function AgentEditForm({ agent }: { agent: { id: string; name: string; role: string; provider?: string; model?: string; systemPrompt?: string; metadata?: Record<string, unknown> } }) {
   const setMode = useStore((s) => s.setAgentPanelMode);
   const updateAgentApi = useStore((s) => s.updateAgentApi);
-  const [form, setForm] = useState({ name: agent.name, provider: agent.provider ?? 'anthropic', model: agent.model ?? '', systemPrompt: agent.systemPrompt ?? '' });
+  const [form, setForm] = useState({
+    name: agent.name,
+    provider: agent.provider ?? 'anthropic',
+    model: agent.model ?? '',
+    systemPrompt: agent.systemPrompt ?? '',
+    fallbackProvider: (agent.metadata?.fallbackProvider as string) ?? '',
+    fallbackModel: (agent.metadata?.fallbackModel as string) ?? '',
+  });
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ ok: boolean; msg: string } | null>(null);
 
@@ -767,7 +796,12 @@ function AgentEditForm({ agent }: { agent: { id: string; name: string; role: str
   const handleSave = async () => {
     setSaving(true);
     setFeedback(null);
-    const ok = await updateAgentApi(agent.id, { name: form.name.trim(), provider: form.provider, model: form.model.trim(), systemPrompt: form.systemPrompt.trim() || undefined });
+    const metadata: Record<string, unknown> = { ...(agent.metadata ?? {}) };
+    if (form.fallbackProvider.trim()) metadata.fallbackProvider = form.fallbackProvider.trim();
+    else delete metadata.fallbackProvider;
+    if (form.fallbackModel.trim()) metadata.fallbackModel = form.fallbackModel.trim();
+    else delete metadata.fallbackModel;
+    const ok = await updateAgentApi(agent.id, { name: form.name.trim(), provider: form.provider, model: form.model.trim(), systemPrompt: form.systemPrompt.trim() || undefined, metadata });
     setSaving(false);
     if (ok) { setFeedback({ ok: true, msg: '수정 완료' }); setTimeout(() => setMode('detail'), 800); }
     else setFeedback({ ok: false, msg: '수정 실패' });
@@ -804,6 +838,17 @@ function AgentEditForm({ agent }: { agent: { id: string; name: string; role: str
       <FormField label="System Prompt">
         <textarea value={form.systemPrompt} onChange={(e) => setForm({ ...form, systemPrompt: e.target.value })} rows={3} style={{ ...inputStyle, resize: 'vertical' }} />
       </FormField>
+      <FormField label="폴백 Provider (선택)">
+        <select value={form.fallbackProvider} onChange={(e) => setForm({ ...form, fallbackProvider: e.target.value })} style={selectStyle}>
+          <option value="">(없음)</option>
+          {PROVIDERS.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+      </FormField>
+      {form.fallbackProvider && (
+        <FormField label="폴백 Model (선택)">
+          <input value={form.fallbackModel} onChange={(e) => setForm({ ...form, fallbackModel: e.target.value })} placeholder="예: claude-haiku-4-5-20251001" style={inputStyle} />
+        </FormField>
+      )}
       {feedback && (
         <div style={{ padding: '8px 12px', borderRadius: 6, fontSize: 12, marginTop: 8, background: feedback.ok ? 'rgba(68,204,102,0.1)' : 'rgba(255,68,68,0.1)', color: feedback.ok ? '#44CC66' : '#FF4444' }}>
           {feedback.ok ? '✓' : '✗'} {feedback.msg}

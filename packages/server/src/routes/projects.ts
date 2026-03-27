@@ -1,6 +1,15 @@
 import { Router, type Request, type Response } from 'express';
+import { sendError } from '../routeError.js';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { ServerDatabase } from '../database.js';
 import type { WebSocketManager } from '../websocket/index.js';
+
+/** Convert a project name to a safe directory slug */
+function slugify(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'project';
+}
 
 function getDb(req: Request): ServerDatabase {
   return req.app.locals.db as ServerDatabase;
@@ -25,7 +34,7 @@ export function createProjectsRouter(): Router {
       const projects = await db.listProjects();
       res.json({ data: projects, total: projects.length });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to list projects', detail: String(err) });
+      sendError(res, 500, 'Failed to list projects', err);
     }
   });
 
@@ -36,15 +45,35 @@ export function createProjectsRouter(): Router {
       const { name, description, repoPath, config } = req.body;
 
       if (!name || typeof name !== 'string') {
-        res.status(400).json({ error: 'name is required and must be a string' });
+        res.status(400).json({ error: 'MISSING_NAME', message: 'name은 필수 문자열입니다.' });
         return;
       }
       if (!config || typeof config !== 'object') {
-        res.status(400).json({ error: 'config is required and must be an object' });
+        res.status(400).json({ error: 'MISSING_CONFIG', message: 'config 객체가 필요합니다.' });
         return;
       }
 
-      const project = await db.createProject({ name, description, repoPath, config });
+      // Resolve effective repo path (auto-create if not provided)
+      let effectiveRepoPath: string | undefined;
+      if (repoPath && typeof repoPath === 'string' && repoPath.trim()) {
+        effectiveRepoPath = repoPath.trim();
+        try {
+          mkdirSync(effectiveRepoPath, { recursive: true });
+        } catch (mkErr) {
+          res.status(400).json({
+            error: 'INVALID_REPO_PATH',
+            message: `경로를 생성할 수 없습니다: ${effectiveRepoPath}`,
+            hint: '절대 경로를 입력하세요 (예: C:\\Users\\user\\projects\\my-app)',
+          });
+          return;
+        }
+      } else {
+        // Auto-generate path under ~/mct-madev-projects/{slug}
+        effectiveRepoPath = join(homedir(), 'mct-madev-projects', slugify(name));
+        mkdirSync(effectiveRepoPath, { recursive: true });
+      }
+
+      const project = await db.createProject({ name, description, repoPath: effectiveRepoPath, config });
 
       // Auto-create agents if teamPreset provided
       if (req.body.teamPreset) {
@@ -82,7 +111,7 @@ export function createProjectsRouter(): Router {
 
       res.status(201).json({ data: project });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to create project', detail: String(err) });
+      sendError(res, 500, 'Failed to create project', err);
     }
   });
 
@@ -97,7 +126,7 @@ export function createProjectsRouter(): Router {
       }
       res.json({ data: project });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to get project', detail: String(err) });
+      sendError(res, 500, 'Failed to get project', err);
     }
   });
 
@@ -105,15 +134,23 @@ export function createProjectsRouter(): Router {
   router.put('/:id', async (req: Request, res: Response) => {
     try {
       const db = getDb(req);
-      const existing = await db.getProject(param(req, 'id'));
+      const id = param(req, 'id');
+      const existing = await db.getProject(id);
       if (!existing) {
         res.status(404).json({ error: 'Project not found' });
         return;
       }
-      const updated = await db.updateProject(param(req, 'id'), req.body);
+      const updates = req.body;
+      if (updates.repoPath && updates.repoPath !== existing.repoPath) {
+        if (!existsSync(updates.repoPath)) {
+          res.status(400).json({ error: 'repoPath does not exist on disk' });
+          return;
+        }
+      }
+      const updated = await db.updateProject(id, updates);
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to update project', detail: String(err) });
+      sendError(res, 500, 'Failed to update project', err);
     }
   });
 
@@ -121,15 +158,25 @@ export function createProjectsRouter(): Router {
   router.delete('/:id', async (req: Request, res: Response) => {
     try {
       const db = getDb(req);
-      const existing = await db.getProject(param(req, 'id'));
+      const id = param(req, 'id');
+      const existing = await db.getProject(id);
       if (!existing) {
         res.status(404).json({ error: 'Project not found' });
         return;
       }
-      await db.deleteProject(param(req, 'id'));
+      // Refuse deletion if tasks are still running
+      const runningTasks = await db.listTasks(id, { status: 'IN_PROGRESS' as import('@mct-madev/core').TaskStatus });
+      if (runningTasks.length > 0) {
+        res.status(409).json({
+          error: 'TASKS_RUNNING',
+          message: `${runningTasks.length}개 태스크가 실행 중입니다. 완료 후 삭제하세요.`,
+        });
+        return;
+      }
+      await db.deleteProject(id);
       res.status(204).send();
     } catch (err) {
-      res.status(500).json({ error: 'Failed to delete project', detail: String(err) });
+      sendError(res, 500, 'Failed to delete project', err);
     }
   });
 
@@ -145,27 +192,35 @@ export function createProjectsRouter(): Router {
 
       await db.updateProject(id, { status: 'SUSPENDED' } as any);
 
-      // Move all agents to Break Room
+      // Move all agents to Break Room in parallel (no race condition on suspend)
       const agents = await db.listAgents(id);
       const breakPositions = (await import('@mct-madev/core')).BREAK_ROOM_POSITIONS;
-      for (let i = 0; i < agents.length; i++) {
+      await Promise.all(agents.map(async (agent, i) => {
         const pos = breakPositions[i % breakPositions.length];
-        const updated = await db.updateAgent(agents[i].id, { visualState: 'WALKING' as any, position: pos } as any);
+        const updated = await db.updateAgent(agent.id, { visualState: 'WALKING' as any, position: pos } as any);
         if (wss) {
-          setTimeout(() => {
-            wss.broadcastToProject(id, { type: 'agent:update' as any, timestamp: new Date().toISOString(), payload: updated });
-          }, i * 300);
+          wss.broadcastToProject(id, { type: 'agent:update' as any, timestamp: new Date().toISOString(), payload: updated });
         }
-      }
+      }));
 
       if (wss) {
         wss.broadcastToProject(id, { type: 'project:status_changed' as any, timestamp: new Date().toISOString(), payload: { projectId: id, previousStatus: project.status ?? 'ACTIVE', newStatus: 'SUSPENDED' } });
+        wss.broadcastToProject(id, {
+          type: 'chat:message' as never,
+          timestamp: new Date().toISOString(),
+          payload: {
+            role: 'assistant',
+            content: '⏸ 프로젝트가 일시중지되었습니다. 모든 에이전트가 Break Room으로 이동했습니다.',
+            sender: 'System',
+            timestamp: new Date().toISOString(),
+          },
+        });
       }
 
       const updated = await db.getProject(id);
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to suspend project', detail: String(err) });
+      sendError(res, 500, 'Failed to suspend project', err);
     }
   });
 
@@ -203,7 +258,7 @@ export function createProjectsRouter(): Router {
       const updated = await db.getProject(id);
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to resume project', detail: String(err) });
+      sendError(res, 500, 'Failed to resume project', err);
     }
   });
 
@@ -218,18 +273,16 @@ export function createProjectsRouter(): Router {
 
       await db.updateProject(id, { status: 'CLOSED' } as any);
 
-      // Move all agents to Break Room
+      // Move all agents to Break Room in parallel (no race condition on suspend)
       const agents = await db.listAgents(id);
       const breakPositions = (await import('@mct-madev/core')).BREAK_ROOM_POSITIONS;
-      for (let i = 0; i < agents.length; i++) {
+      await Promise.all(agents.map(async (agent, i) => {
         const pos = breakPositions[i % breakPositions.length];
-        const updated = await db.updateAgent(agents[i].id, { visualState: 'WALKING' as any, position: pos } as any);
+        const updated = await db.updateAgent(agent.id, { visualState: 'WALKING' as any, position: pos } as any);
         if (wss) {
-          setTimeout(() => {
-            wss.broadcastToProject(id, { type: 'agent:update' as any, timestamp: new Date().toISOString(), payload: updated });
-          }, i * 300);
+          wss.broadcastToProject(id, { type: 'agent:update' as any, timestamp: new Date().toISOString(), payload: updated });
         }
-      }
+      }));
 
       if (wss) {
         wss.broadcastToProject(id, { type: 'project:status_changed' as any, timestamp: new Date().toISOString(), payload: { projectId: id, previousStatus: project.status ?? 'ACTIVE', newStatus: 'CLOSED' } });
@@ -238,7 +291,28 @@ export function createProjectsRouter(): Router {
       const updated = await db.getProject(id);
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to close project', detail: String(err) });
+      sendError(res, 500, 'Failed to close project', err);
+    }
+  });
+
+  // GET /projects/:id/usage — token usage summary
+  router.get('/:id/usage', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const id = param(req, 'id');
+      const project = await db.getProject(id);
+      if (!project) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      if (!db.getTokenUsage) {
+        res.json({ data: { totalInputTokens: 0, totalOutputTokens: 0, byProvider: {}, byAgent: {} } });
+        return;
+      }
+      const usage = await db.getTokenUsage(id);
+      res.json({ data: usage });
+    } catch (err) {
+      sendError(res, 500, 'Failed to get token usage', err);
     }
   });
 

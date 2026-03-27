@@ -2,6 +2,8 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { Server as HttpServer } from 'node:http';
 import { EventEmitter } from 'node:events';
 import type { SystemEvent } from '@mct-madev/core';
+import type { ServerDatabase } from '../database.js';
+import { logger } from '../logger.js';
 
 const HEARTBEAT_INTERVAL = 30_000;
 
@@ -25,7 +27,7 @@ interface ClientCommand {
   projectId: string;
 }
 
-export function createWebSocketServer(server: HttpServer): WebSocketManager {
+export function createWebSocketServer(server: HttpServer, db?: ServerDatabase): WebSocketManager {
   const emitter = new EventEmitter() as WebSocketManager;
   const clients = new Map<WebSocket, ClientMeta>();
 
@@ -59,7 +61,12 @@ export function createWebSocketServer(server: HttpServer): WebSocketManager {
         emitter.emit('message', message, ws);
 
         // Handle subscribe/unsubscribe commands
-        handleClientCommand(ws, message);
+        handleClientCommand(ws, message).catch((err) => {
+          logger.error({ err: String(err) }, 'WebSocket command handler failed');
+          try {
+            ws.send(JSON.stringify({ type: 'error', message: 'Command failed unexpectedly' }));
+          } catch { /* ws may be closed */ }
+        });
       } catch {
         // Ignore malformed messages
       }
@@ -80,17 +87,25 @@ export function createWebSocketServer(server: HttpServer): WebSocketManager {
     clearInterval(heartbeat);
   });
 
-  function handleClientCommand(ws: WebSocket, message: unknown): void {
+  async function handleClientCommand(ws: WebSocket, message: unknown): Promise<void> {
     if (!message || typeof message !== 'object') return;
     const cmd = message as ClientCommand;
 
-    if (cmd.type === 'subscribe' && cmd.projectId && typeof cmd.projectId === 'string') {
+    if (cmd.type === 'subscribe' && cmd.projectId && typeof cmd.projectId === 'string' && cmd.projectId.length <= 100) {
       const meta = clients.get(ws);
       if (meta) {
-        meta.subscriptions.add(cmd.projectId);
-        ws.send(JSON.stringify({ type: 'subscribed', projectId: cmd.projectId }));
+        // Validate project exists before allowing subscription
+        const allowed = db
+          ? await db.getProject(cmd.projectId).then((p) => p !== undefined).catch(() => false)
+          : true; // no db = allow (dev mode)
+        if (allowed) {
+          meta.subscriptions.add(cmd.projectId);
+          ws.send(JSON.stringify({ type: 'subscribed', projectId: cmd.projectId }));
+        } else {
+          ws.send(JSON.stringify({ type: 'error', message: 'Project not found', projectId: cmd.projectId }));
+        }
       }
-    } else if (cmd.type === 'unsubscribe' && cmd.projectId && typeof cmd.projectId === 'string') {
+    } else if (cmd.type === 'unsubscribe' && cmd.projectId && typeof cmd.projectId === 'string' && cmd.projectId.length <= 100) {
       const meta = clients.get(ws);
       if (meta) {
         meta.subscriptions.delete(cmd.projectId);

@@ -85,12 +85,15 @@ export function ChatPanel() {
   const chatMessages = useStore((s) => s.chatMessages);
   const addChatMessage = useStore((s) => s.addChatMessage);
   const currentProjectId = useStore((s) => s.currentProjectId);
+  const tasks = useStore((s) => s.tasks);
 
   const [mode, setMode] = useState<Mode>('bubble');
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [sendingPhase, setSendingPhase] = useState<'idle' | 'classifying' | 'orchestrating'>('idle');
   const [inputVisible, setInputVisible] = useState(false);
   const [chatVisible, setChatVisible] = useState(false);
+  const [lastFailedMessage, setLastFailedMessage] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -151,11 +154,26 @@ export function ChatPanel() {
     setChatOpen(true);
   }, [setChatOpen]);
 
-  const handleSend = useCallback(async () => {
-    if (!input.trim() || sending || !currentProjectId) return;
-    const message = input.trim();
-    setInput('');
+  /* listen for orchestration complete/error events from WS */
+  useEffect(() => {
+    const onEvent = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { type: string };
+      if (detail?.type === 'orchestration_complete' || detail?.type === 'orchestration_error') {
+        setSendingPhase('idle');
+        setSending(false);
+      }
+    };
+    window.addEventListener('mct:event', onEvent);
+    return () => window.removeEventListener('mct:event', onEvent);
+  }, []);
+
+  const handleSend = useCallback(async (overrideMessage?: string) => {
+    const message = (overrideMessage ?? input).trim();
+    if (!message || sending || !currentProjectId) return;
+    if (!overrideMessage) setInput('');
     setSending(true);
+    setSendingPhase('classifying');
+    setLastFailedMessage(null);
 
     addChatMessage({
       role: 'user',
@@ -175,13 +193,24 @@ export function ChatPanel() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({})) as Record<string, string>;
         const errMsg = err.error ?? 'Failed to send';
-        const detail = err.detail ? `\n${err.detail}` : '';
         addChatMessage({
           role: 'assistant',
-          content: `Error: ${errMsg}${detail}`,
+          content: `Error: ${errMsg}`,
           sender: 'System',
           timestamp: new Date().toISOString(),
         });
+        setLastFailedMessage(message);
+        setSendingPhase('idle');
+        setSending(false);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (data?.data?.intent === 'directive') {
+          // Background orchestration started — keep sending=true until WS complete event
+          setSendingPhase('orchestrating');
+        } else {
+          setSendingPhase('idle');
+          setSending(false);
+        }
       }
     } catch {
       addChatMessage({
@@ -190,7 +219,8 @@ export function ChatPanel() {
         sender: 'System',
         timestamp: new Date().toISOString(),
       });
-    } finally {
+      setLastFailedMessage(message);
+      setSendingPhase('idle');
       setSending(false);
     }
   }, [input, sending, currentProjectId, mode, addChatMessage]);
@@ -295,7 +325,7 @@ export function ChatPanel() {
             }}
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={sending || !input.trim()}
             style={{
               width: 36,
@@ -586,11 +616,63 @@ export function ChatPanel() {
                       animation: `typingDot 1.2s ease-in-out ${i * 0.15}s infinite`,
                     }} />
                   ))}
+                  {sendingPhase !== 'idle' && (
+                    <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', marginLeft: 6 }}>
+                      {sendingPhase === 'classifying' ? '분석 중...' : '오케스트레이션 실행 중...'}
+                    </span>
+                  )}
                 </div>
               </div>
             )}
             <div ref={messagesEndRef} />
           </div>
+
+          {/* -- Orchestration Progress -- */}
+          {(() => {
+            const activeTasks = tasks.filter((t) => ['IN_PROGRESS', 'CREATED', 'PLANNING', 'REVIEWING', 'CODE_REVIEW', 'MERGING'].includes(t.status));
+            const doneTasks = tasks.filter((t) => t.status === 'DONE');
+            const total = tasks.length;
+            if (total === 0 || activeTasks.length === 0) return null;
+            const pct = Math.round((doneTasks.length / total) * 100);
+            return (
+              <div style={{ padding: '6px 14px', borderTop: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'rgba(255,255,255,0.35)', marginBottom: 4 }}>
+                  <span style={{ color: '#44BBAA' }}>{activeTasks.length} running</span>
+                  <span>{doneTasks.length}/{total} done</span>
+                </div>
+                <div style={{ height: 2, borderRadius: 1, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+                  <div style={{ width: `${pct}%`, height: '100%', background: 'linear-gradient(90deg, #4488FF, #44CC66)', transition: 'width 0.4s ease' }} />
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* -- Retry banner -- */}
+          {lastFailedMessage && (
+            <div style={{
+              padding: '6px 14px',
+              borderTop: '1px solid rgba(255,255,255,0.06)',
+              flexShrink: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+            }}>
+              <span style={{ fontSize: 10, color: 'rgba(255,120,120,0.8)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                Failed: "{lastFailedMessage.slice(0, 40)}{lastFailedMessage.length > 40 ? '...' : ''}"
+              </span>
+              <button
+                onClick={() => handleSend(lastFailedMessage)}
+                style={{
+                  fontSize: 10, padding: '3px 10px', borderRadius: 6, cursor: 'pointer', flexShrink: 0,
+                  background: 'rgba(204,51,51,0.15)', color: '#ff8888',
+                  border: '1px solid rgba(204,51,51,0.35)',
+                }}
+              >
+                재시도
+              </button>
+            </div>
+          )}
 
           {/* -- Input Area -- */}
           <div style={{
@@ -626,7 +708,7 @@ export function ChatPanel() {
                 }}
               />
               <button
-                onClick={handleSend}
+                onClick={() => handleSend()}
                 disabled={sending || !input.trim()}
                 style={{
                   width: 40,

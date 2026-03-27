@@ -22,6 +22,39 @@ interface OpenAICompatibleResponse {
   };
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 3,
+  timeoutMs = 120_000,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      clearTimeout(timer);
+      if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
+        await sleep(1000 * 2 ** attempt);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      if (attempt < maxRetries) {
+        await sleep(1000 * 2 ** attempt);
+      }
+    }
+  }
+  throw lastErr ?? new Error('fetchWithRetry: max retries exceeded');
+}
+
 export abstract class OpenAICompatibleProvider implements IProvider {
   abstract readonly name: string;
   abstract readonly provider: string;
@@ -52,7 +85,7 @@ export abstract class OpenAICompatibleProvider implements IProvider {
 
     const chatMessages: OpenAICompatibleMessage[] = messages.map((m) => ({
       role: m.role,
-      content: m.content,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
     }));
 
     const body: Record<string, unknown> = {
@@ -70,7 +103,7 @@ export abstract class OpenAICompatibleProvider implements IProvider {
     const baseUrl = config.baseUrl ?? this.baseUrl;
     const endpoint = this.getChatEndpoint(baseUrl);
 
-    const response = await fetch(endpoint, {
+    const response = await fetchWithRetry(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -81,7 +114,8 @@ export abstract class OpenAICompatibleProvider implements IProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`${this.name} API error (${response.status}): ${errorText}`);
+      const safeError = errorText.slice(0, 500).replace(/sk-[A-Za-z0-9_-]{10,}/g, '[REDACTED]');
+      throw new Error(`${this.name} API error (${response.status}): ${safeError}`);
     }
 
     const data = (await response.json()) as OpenAICompatibleResponse;

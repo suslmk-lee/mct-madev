@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { useStore } from '../store/useStore';
 import type { TaskStatus } from '../store/useStore';
 
+const API_BASE = '/api';
+
 const STATUS_COLORS: Record<TaskStatus, string> = {
   CREATED: '#888888',
   PLANNING: '#6688CC',
@@ -36,7 +38,15 @@ export function TaskList() {
   const tasks = useStore((s) => s.tasks);
   const agents = useStore((s) => s.agents);
   const [collapsed, setCollapsed] = useState(false);
-  const [filter, setFilter] = useState<FilterMode>('active');
+  const [filter, setFilter] = useState<FilterMode>(() => {
+    const saved = localStorage.getItem('mct-task-filter');
+    return (saved as FilterMode) || 'active';
+  });
+
+  const handleFilterChange = (f: FilterMode) => {
+    setFilter(f);
+    localStorage.setItem('mct-task-filter', f);
+  };
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
 
   const completedStatuses = ['DONE', 'REJECTED', 'FAILED'];
@@ -248,6 +258,49 @@ export function TaskList() {
           </div>
         )}
 
+        {/* Action buttons */}
+        {(isFailed || isActive || task.status === 'CREATED') && (
+          <div style={{ padding: '0 12px 8px', display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+            {/* Cancel button for running/pending tasks */}
+            {(isActive || task.status === 'CREATED') && (
+              <button
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  if (!window.confirm(`"${task.title}" 태스크를 취소하시겠습니까? 의존하는 태스크도 함께 취소됩니다.`)) return;
+                  fetch(`${API_BASE}/tasks/${task.id}/cancel`, { method: 'POST' }).catch(() => {});
+                }}
+                style={{
+                  fontSize: 10, padding: '2px 8px', borderRadius: 4, cursor: 'pointer',
+                  background: 'rgba(150,100,50,0.15)', color: '#ffaa66',
+                  border: '1px solid rgba(150,100,50,0.35)', transition: 'all 0.15s',
+                }}
+                onMouseOver={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(150,100,50,0.3)'; }}
+                onMouseOut={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(150,100,50,0.15)'; }}
+              >
+                취소
+              </button>
+            )}
+            {/* Retry button for failed tasks */}
+            {isFailed && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  fetch(`${API_BASE}/tasks/${task.id}/retry`, { method: 'POST' }).catch(() => {});
+                }}
+                style={{
+                  fontSize: 10, padding: '2px 8px', borderRadius: 4, cursor: 'pointer',
+                  background: 'rgba(204,51,51,0.15)', color: '#ff8888',
+                  border: '1px solid rgba(204,51,51,0.35)', transition: 'all 0.15s',
+                }}
+                onMouseOver={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(204,51,51,0.3)'; }}
+                onMouseOut={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(204,51,51,0.15)'; }}
+              >
+                재시도
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Expand indicator */}
         {hasDetail && (
           <div style={{
@@ -310,7 +363,7 @@ export function TaskList() {
                   color: filter === mode ? '#88bbff' : '#666',
                   border: filter === mode ? '1px solid rgba(68,136,255,0.3)' : '1px solid transparent',
                 }}
-                onClick={() => setFilter(mode)}
+                onClick={() => handleFilterChange(mode)}
               >
                 {mode === 'active' ? 'Active' : mode === 'done' ? 'Done' : 'All'}
               </button>

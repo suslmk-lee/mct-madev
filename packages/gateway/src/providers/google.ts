@@ -45,13 +45,13 @@ export class GoogleProvider implements IProvider {
       .filter((m) => m.role !== 'system')
       .map((m) => ({
         role: m.role === 'assistant' ? ('model' as const) : ('user' as const),
-        parts: [{ text: m.content }],
+        parts: [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }],
       }));
 
     const body: Record<string, unknown> = { contents };
 
     if (systemInstruction) {
-      body.systemInstruction = { parts: [{ text: systemInstruction.content }] };
+      body.systemInstruction = { parts: [{ text: typeof systemInstruction.content === 'string' ? systemInstruction.content : '' }] };
     }
 
     const generationConfig: Record<string, unknown> = {};
@@ -88,7 +88,8 @@ export class GoogleProvider implements IProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Google Gemini API error (${response.status}): ${errorText}`);
+      const safeError = errorText.slice(0, 500).replace(/AIza[A-Za-z0-9_-]{10,}/g, '[REDACTED]');
+      throw new Error(`Google Gemini API error (${response.status}): ${safeError}`);
     }
 
     const data = (await response.json()) as GeminiResponse;

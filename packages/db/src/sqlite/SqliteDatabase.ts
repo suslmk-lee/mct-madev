@@ -1,5 +1,4 @@
-import { readFileSync } from 'node:fs';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import initSqlJs, { type Database as SqlJsDatabase } from 'sql.js';
 import type { Agent, Project, Task, Workflow } from '@mct-madev/core';
 import type { IDatabase } from '../types.js';
@@ -11,6 +10,8 @@ import type {
   TaskFilter,
   TokenUsageInput,
   TokenUsageSummary,
+  ToolCallEntry,
+  ToolCallInput,
 } from '../models.js';
 
 const INIT_SQL = `
@@ -106,10 +107,24 @@ CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_workflow ON tasks(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_agent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_project ON token_usage(project_id);
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  input TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT '',
+  is_error INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_logs_project ON logs(project_id);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_task ON tool_calls(task_id);
 `;
 
 // ── Row types ─────────────────────────────────────────────────────────
@@ -224,7 +239,7 @@ function rowToProject(row: ProjectRow): Project {
     name: row.name,
     description: row.description ?? undefined,
     repoPath: row.repo_path ?? undefined,
-    config: JSON.parse(row.config),
+    config: safeJsonParse(row.config, {} as any),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     status: (row.status ?? 'ACTIVE') as any,
@@ -241,9 +256,9 @@ function rowToAgent(row: AgentRow): Agent {
     model: row.model,
     systemPrompt: row.system_prompt ?? undefined,
     visualState: row.visual_state as Agent['visualState'],
-    position: JSON.parse(row.position),
+    position: safeJsonParse(row.position, { x: 0, y: 0, z: 0 }),
     currentTaskId: row.current_task_id ?? undefined,
-    metadata: JSON.parse(row.metadata),
+    metadata: safeJsonParse(row.metadata, {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -260,8 +275,8 @@ function rowToTask(row: TaskRow): Task {
     status: row.status as Task['status'],
     assigneeAgentId: row.assignee_agent_id ?? undefined,
     priority: row.priority,
-    dependencies: JSON.parse(row.dependencies),
-    metadata: JSON.parse(row.metadata),
+    dependencies: safeJsonParse(row.dependencies, []),
+    metadata: safeJsonParse(row.metadata, {}),
     result: row.result ?? undefined,
     error: row.error ?? undefined,
     createdAt: row.created_at,
@@ -274,10 +289,10 @@ function rowToWorkflow(row: WorkflowRow): Workflow {
     id: row.id,
     projectId: row.project_id,
     name: row.name,
-    definition: JSON.parse(row.definition),
+    definition: safeJsonParse(row.definition, {} as any),
     status: row.status as Workflow['status'],
     currentStageId: row.current_stage_id ?? undefined,
-    results: JSON.parse(row.results),
+    results: safeJsonParse(row.results, {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -302,9 +317,14 @@ function rowToLog(row: LogRow): LogEntry {
     level: row.level as LogEntry['level'],
     source: row.source,
     message: row.message,
-    metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+    metadata: row.metadata ? safeJsonParse(row.metadata, undefined) : undefined,
     createdAt: row.created_at,
   };
+}
+
+function safeJsonParse<T>(str: string | null | undefined, fallback: T): T {
+  if (!str) return fallback;
+  try { return JSON.parse(str) as T; } catch { return fallback; }
 }
 
 function now(): string {
@@ -347,12 +367,36 @@ export class SqliteDatabase implements IDatabase {
       this.db.run("ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'");
       this.save();
     }
+
+    // Migrate: create tool_calls table if missing (added in v0.2)
+    try {
+      this.db.run('SELECT id FROM tool_calls LIMIT 1');
+    } catch {
+      this.db.run(`CREATE TABLE IF NOT EXISTS tool_calls (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        input TEXT NOT NULL DEFAULT '{}',
+        result TEXT NOT NULL DEFAULT '',
+        is_error INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )`);
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_tool_calls_task ON tool_calls(task_id)');
+      this.save();
+    }
   }
 
   private save(): void {
     if (this.persistToDisk) {
       const data = this.db.export();
-      writeFileSync(this.dbPath, Buffer.from(data));
+      const tmp = this.dbPath + '.tmp';
+      writeFileSync(tmp, Buffer.from(data));
+      try {
+        renameSync(tmp, this.dbPath); // atomic on POSIX; best-effort on Windows
+      } catch {
+        writeFileSync(this.dbPath, Buffer.from(data)); // fallback direct write
+      }
     }
   }
 
@@ -484,7 +528,7 @@ export class SqliteDatabase implements IDatabase {
     return row ? rowToTask(row) : null;
   }
 
-  async listTasks(projectId: string, filters?: TaskFilter): Promise<Task[]> {
+  async listTasks(projectId: string, filters?: TaskFilter, pagination?: { limit?: number; offset?: number }): Promise<Task[]> {
     const conditions: string[] = ['project_id = ?'];
     const values: unknown[] = [projectId];
 
@@ -492,8 +536,21 @@ export class SqliteDatabase implements IDatabase {
     if (filters?.assigneeAgentId) { conditions.push('assignee_agent_id = ?'); values.push(filters.assigneeAgentId); }
     if (filters?.workflowId) { conditions.push('workflow_id = ?'); values.push(filters.workflowId); }
 
-    const sql = `SELECT * FROM tasks WHERE ${conditions.join(' AND ')} ORDER BY priority DESC, created_at`;
+    const limit = Math.min(Math.max(1, pagination?.limit ?? 500), 500);
+    const offset = Math.max(0, pagination?.offset ?? 0);
+    const sql = `SELECT * FROM tasks WHERE ${conditions.join(' AND ')} ORDER BY priority DESC, created_at LIMIT ? OFFSET ?`;
+    values.push(limit, offset);
     return stmtToRows<TaskRow>(this.db, sql, values).map(rowToTask);
+  }
+
+  async countTasks(projectId: string, filters?: TaskFilter): Promise<number> {
+    const conditions: string[] = ['project_id = ?'];
+    const values: unknown[] = [projectId];
+    if (filters?.status) { conditions.push('status = ?'); values.push(filters.status); }
+    if (filters?.assigneeAgentId) { conditions.push('assignee_agent_id = ?'); values.push(filters.assigneeAgentId); }
+    if (filters?.workflowId) { conditions.push('workflow_id = ?'); values.push(filters.workflowId); }
+    const row = stmtGetOne<{ count: number }>(this.db, `SELECT COUNT(*) as count FROM tasks WHERE ${conditions.join(' AND ')}`, values);
+    return row?.count ?? 0;
   }
 
   async updateTask(id: string, updates: Partial<Task>): Promise<Task> {
@@ -580,8 +637,8 @@ export class SqliteDatabase implements IDatabase {
     return rowToMessage(row);
   }
 
-  async listMessages(taskId: string): Promise<Message[]> {
-    return stmtToRows<MessageRow>(this.db, 'SELECT * FROM messages WHERE task_id = ? ORDER BY created_at', [taskId]).map(rowToMessage);
+  async listMessages(taskId: string, limit = 200): Promise<Message[]> {
+    return stmtToRows<MessageRow>(this.db, 'SELECT * FROM messages WHERE task_id = ? ORDER BY created_at DESC LIMIT ?', [taskId, limit]).map(rowToMessage).reverse();
   }
 
   // ── Logs ──────────────────────────────────────────────────────────
@@ -646,5 +703,33 @@ export class SqliteDatabase implements IDatabase {
     }
 
     return summary;
+  }
+
+  // ── Tool call logging ──────────────────────────────────────────────────
+
+  async logToolCall(entry: ToolCallInput): Promise<ToolCallEntry> {
+    const id = crypto.randomUUID();
+    const ts = now();
+    this.db.run(
+      `INSERT INTO tool_calls (id, task_id, agent_id, tool_name, input, result, is_error, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, entry.taskId, entry.agentId, entry.toolName, JSON.stringify(entry.input), entry.result, entry.isError ? 1 : 0, ts],
+    );
+    this.save();
+    return { ...entry, id, createdAt: ts };
+  }
+
+  async getToolCalls(taskId: string): Promise<ToolCallEntry[]> {
+    interface ToolCallRow {
+      id: string; task_id: string; agent_id: string; tool_name: string;
+      input: string; result: string; is_error: number; created_at: string;
+    }
+    const rows = stmtToRows<ToolCallRow>(
+      this.db, 'SELECT * FROM tool_calls WHERE task_id = ? ORDER BY created_at ASC', [taskId],
+    );
+    return rows.map((r) => ({
+      id: r.id, taskId: r.task_id, agentId: r.agent_id, toolName: r.tool_name,
+      input: safeJsonParse(r.input, {}), result: r.result, isError: Boolean(r.is_error), createdAt: r.created_at,
+    }));
   }
 }

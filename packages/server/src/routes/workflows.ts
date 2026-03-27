@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { sendError } from '../routeError.js';
 import type { ServerDatabase } from '../database.js';
 import type { WebSocketManager } from '../websocket/index.js';
 import { EventType, type SystemEvent, type WorkflowStatusPayload } from '@mct-madev/core';
@@ -26,7 +27,7 @@ export function createWorkflowsRouter(): Router {
       const workflows = await db.listWorkflows(param(req, 'projectId'));
       res.json({ data: workflows, total: workflows.length });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to list workflows', detail: String(err) });
+      sendError(res, 500, 'Failed to list workflows', err);
     }
   });
 
@@ -55,7 +56,7 @@ export function createWorkflowsRouter(): Router {
       });
       res.status(201).json({ data: workflow });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to create workflow', detail: String(err) });
+      sendError(res, 500, 'Failed to create workflow', err);
     }
   });
 
@@ -70,7 +71,7 @@ export function createWorkflowsRouter(): Router {
       }
       res.json({ data: workflow });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to get workflow', detail: String(err) });
+      sendError(res, 500, 'Failed to get workflow', err);
     }
   });
 
@@ -86,7 +87,7 @@ export function createWorkflowsRouter(): Router {
       const updated = await db.updateWorkflow(param(req, 'id'), req.body);
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to update workflow', detail: String(err) });
+      sendError(res, 500, 'Failed to update workflow', err);
     }
   });
 
@@ -150,7 +151,7 @@ export function createWorkflowsRouter(): Router {
 
       res.json({ data: updated });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to start workflow', detail: String(err) });
+      sendError(res, 500, 'Failed to start workflow', err);
     }
   });
 

@@ -7,6 +7,8 @@ import { TaskList } from './ui/TaskList';
 import { ChatPanel } from './ui/ChatPanel';
 import { StatusLog } from './ui/StatusLog';
 import { ProjectModal } from './ui/ProjectModal';
+import { FilePanel } from './ui/FilePanel';
+import { ErrorBoundary } from './ui/ErrorBoundary';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useIdleBehavior } from './hooks/useIdleBehavior';
 import { useStore } from './store/useStore';
@@ -43,23 +45,32 @@ export function App() {
 
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
-      <Canvas
-        shadows
-        camera={{ position: [25, 22, 25], fov: 30, near: 0.1, far: 500 }}
-        gl={{ antialias: true, toneMapping: 3 /* ACESFilmic */ }}
-        onPointerMissed={() => {
-          // Deselect agent when clicking empty space
-          // (handled by store if needed)
-        }}
-      >
-        <OfficeScene />
-      </Canvas>
-      <HUD />
-      <StatusLog />
-      <AgentDetailPanel />
-      <TaskList />
-      <ChatPanel />
-      <ProjectModal />
+      <ErrorBoundary fallback={
+        <div style={{ width: '100vw', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0a1a', color: 'rgba(255,255,255,0.4)', fontSize: 14 }}>
+          3D 씬을 불러올 수 없습니다.
+        </div>
+      }>
+        <Canvas
+          shadows
+          camera={{ position: [25, 22, 25], fov: 30, near: 0.1, far: 500 }}
+          gl={{ antialias: true, toneMapping: 3 /* ACESFilmic */ }}
+          onPointerMissed={() => {
+            // Deselect agent when clicking empty space
+            // (handled by store if needed)
+          }}
+        >
+          <OfficeScene />
+        </Canvas>
+      </ErrorBoundary>
+      <ErrorBoundary>
+        <HUD />
+        <StatusLog />
+        <AgentDetailPanel />
+        <TaskList />
+        <ChatPanel />
+        <ProjectModal />
+        <FilePanel />
+      </ErrorBoundary>
 
       {/* Global animation keyframes + dark select */}
       <style>{`

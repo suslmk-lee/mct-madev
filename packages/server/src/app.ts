@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import compression from 'compression';
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import type { ServerDatabase } from './database.js';
 import type { WebSocketManager } from './websocket/index.js';
 import { createApiRouter } from './routes/index.js';
+import { logger } from './logger.js';
 
 export interface AppOptions {
   /** Directory to serve static files from (e.g., the built web app) */
@@ -64,10 +65,22 @@ export function createApp(options: AppOptions = {}): express.Express {
   }
 
   // --- Middleware ---
-  app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(cors({ origin: options.corsOrigin ?? true }));
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        connectSrc: ["'self'", 'ws:', 'wss:', 'http:', 'https:'],
+        scriptSrc: ["'self'", "'unsafe-inline'", 'blob:'],
+        workerSrc: ["'self'", 'blob:'],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'blob:'],
+        fontSrc: ["'self'", 'data:'],
+      },
+    },
+  }));
+  app.use(cors({ origin: options.corsOrigin ?? 'http://localhost:5173' }));
   app.use(compression());
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
 
   // --- Health endpoint ---
   app.get('/api/health', (_req: Request, res: Response) => {
@@ -87,6 +100,15 @@ export function createApp(options: AppOptions = {}): express.Express {
 
   // --- API routes ---
   app.use('/api', createApiRouter());
+
+  // --- Error logging middleware ---
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    logger.error({ err: String(err), method: req.method, url: req.url }, 'Unhandled server error');
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
 
   // --- Static file serving ---
   if (options.staticDir) {

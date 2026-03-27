@@ -64,13 +64,38 @@ You must respond with a JSON array of subtask objects, each having:
 ${agentInfo}
 
 IMPORTANT RULES:
-1. ALWAYS include a "Project Setup" subtask as the first item (priority 10) that creates:
-   - package.json with all dependencies
-   - tsconfig.json (if TypeScript)
-   - index.html (if web project)
-   - Main entry point file (e.g., src/main.tsx, src/index.ts)
-   - Bundler config (vite.config.ts, webpack.config.js, etc.) if needed
-2. Each subtask description must specify EXACTLY which files to create (e.g., "Create src/components/Button.tsx with...").
+1. Choose the RIGHT project type based on complexity. Use the project description and context to judge — do NOT rely on file names alone:
+
+   A. SIMPLE (single-page app, CLI tool, simple script, landing page, utility library):
+      → Small scope, single entry point, minimal dependencies.
+      → Examples by stack:
+        - Web: a single self-contained HTML file OR a simple script
+        - Python: main.py + requirements.txt (if any)
+        - Go: main.go + go.mod
+        - Rust: main.rs + Cargo.toml
+        - Node: index.js/ts + package.json
+      → Include a "Implement [main entry point]" subtask (priority 10) that creates one complete, runnable artifact.
+
+   B. MEDIUM (REST API server, full-stack web app with database, mobile app, multi-module library):
+      → Multiple components, a data layer, or client-server split.
+      → Examples by stack:
+        - Web: HTML/CSS/JS multi-page OR React app without complex state
+        - Python: FastAPI/Flask app with models and routes
+        - Go: HTTP server with handlers and middleware
+        - Rust: Binary crate with multiple modules
+        - Node: Express API with routes and a database
+      → Break into Setup, Core Logic, and Integration subtasks.
+
+   C. COMPLEX (microservices, distributed system, real-time platform, ML pipeline, monorepo):
+      → Multiple services, inter-process communication, or significant infrastructure.
+      → Examples by stack:
+        - Any language: event-driven architecture, message queues, orchestration
+        - Python: ML training pipeline, data ingestion + model serving
+        - Go/Rust: high-performance networked services
+        - Node/TypeScript: full-stack monorepo with CI/CD
+      → Include a "Project Setup & Architecture" subtask (priority 10) that defines the directory structure, config files, and inter-service contracts.
+
+2. Each subtask description must specify EXACTLY which files to create AND include the COMPLETE content (not just a description).
 3. Break implementation into small, focused tasks — one concern per task.
 4. Distribute work evenly across available team members based on their role.
 
@@ -176,7 +201,7 @@ ${result}`,
       throw new Error('Expected a JSON array of subtasks');
     }
 
-    return parsed.map(
+    const subtasks = parsed.map(
       (item: Record<string, unknown>): SubtaskDef => ({
         title: String(item.title ?? ''),
         description: String(item.description ?? ''),
@@ -186,5 +211,21 @@ ${result}`,
         metadata: typeof item.metadata === 'object' && item.metadata ? (item.metadata as Record<string, unknown>) : {},
       }),
     );
+
+    // Validate dependency references
+    const titles = new Set(subtasks.map(t => t.title));
+    for (const task of subtasks) {
+      if (task.dependencies) {
+        task.dependencies = task.dependencies.filter(dep => {
+          const valid = titles.has(dep);
+          if (!valid) {
+            console.warn(`[PMAgent] Removing unknown dependency "${dep}" from task "${task.title}"`);
+          }
+          return valid;
+        });
+      }
+    }
+
+    return subtasks;
   }
 }

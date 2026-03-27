@@ -1,8 +1,9 @@
 import { Router, type Request, type Response } from 'express';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { resolve, dirname, join, relative } from 'node:path';
 import type { ServerDatabase } from '../database.js';
 import type { WebSocketManager } from '../websocket/index.js';
+import { logger } from '../logger.js';
 import {
   PMAgent,
   TaskStatus,
@@ -14,11 +15,13 @@ import {
   type GatewayChatFn,
   type SkillDefinition,
   type ExtendedChatResponse,
+  type ContentBlock,
+  type ChatMessage,
 } from '@mct-madev/core';
 
 // ── Built-in file system tools ────────────────────────────────────────────
 
-/** write_file and read_file tools given to every agent */
+/** Built-in file system tools given to every agent */
 const FILE_TOOLS: SkillDefinition[] = [
   {
     name: 'write_file',
@@ -43,7 +46,70 @@ const FILE_TOOLS: SkillDefinition[] = [
       required: ['path'],
     },
   },
+  {
+    name: 'list_files',
+    description: 'List files and directories in a path. Use to explore project structure before writing files.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path from project root. Use "." for root.' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'search_code',
+    description: 'Search for a text pattern across all files in the project.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Text or regex pattern to search for' },
+        path: { type: 'string', description: 'Optional: subdirectory to limit search scope' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'delete_file',
+    description: 'Delete a file from the project directory.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path of the file to delete' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'create_directory',
+    description: 'Create a directory (and any parent directories) in the project.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Relative path of the directory to create' },
+      },
+      required: ['path'],
+    },
+  },
 ];
+
+const ROLE_PROMPTS: Record<string, string> = {
+  DEVELOPER: `You are a software developer. Write clean, complete, production-ready code.
+
+CRITICAL RULES FOR HTML FILES:
+- If creating index.html for a simple/medium project: write the COMPLETE file with ALL content inline.
+  Include actual visible content (text, buttons, UI elements) in the HTML body.
+  Embed all CSS in <style> tags and all JS in <script> tags.
+  The file MUST work when opened directly in a browser with NO build step.
+- Never create an empty or skeleton HTML file. Every HTML file must have real, functional content.
+- For React/TypeScript projects only: index.html may have just <div id="root"> with a script module tag.
+
+Always use the write_file tool for every file you create or modify.`,
+  REVIEWER: 'You are a code reviewer. Review code for correctness, security, performance, and style. Be constructive and specific. Use write_file for any corrected files.',
+  TESTER: 'You are a QA engineer. Write comprehensive tests covering happy path, edge cases, and error scenarios. Use write_file to output test files.',
+  DEVOPS: 'You are a DevOps engineer. Focus on deployment, monitoring, CI/CD, and infrastructure as code. Use write_file for all config and script files.',
+  PM: 'You are a project manager. Coordinate tasks, review deliverables, and ensure quality.',
+};
 
 /** Execute a single tool call. Returns the result string to feed back to LLM. */
 function executeToolCall(
@@ -52,10 +118,16 @@ function executeToolCall(
   targetPath: string,
   writtenFiles: string[],
 ): string {
+  const WRITE_FILE_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+  const READ_FILE_MAX_BYTES = 1 * 1024 * 1024;   // 1 MB
+
   if (toolName === 'write_file') {
     const filePath = String(input.path ?? '').trim();
     const content = String(input.content ?? '');
     if (!filePath) return 'Error: path is required';
+    if (Buffer.byteLength(content, 'utf-8') > WRITE_FILE_MAX_BYTES) {
+      return `Error: content exceeds 10 MB limit (${(Buffer.byteLength(content, 'utf-8') / 1024 / 1024).toFixed(1)} MB)`;
+    }
 
     const safe = filePath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
     const abs = resolve(targetPath, safe);
@@ -78,9 +150,118 @@ function executeToolCall(
     if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
     try {
       if (!existsSync(abs)) return `Error: ${safe} does not exist`;
+      const st = statSync(abs);
+      if (st.size > READ_FILE_MAX_BYTES) {
+        return `Error: ${safe} is too large to read (${(st.size / 1024 / 1024).toFixed(1)} MB, limit 1 MB). Use search_code to find specific sections.`;
+      }
       return readFileSync(abs, 'utf-8');
     } catch (e) {
       return `Error reading ${safe}: ${e}`;
+    }
+  }
+
+  if (toolName === 'list_files') {
+    const dirPath = String(input.path ?? '.').trim();
+    const safe = dirPath === '.' ? '' : dirPath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    const abs = resolve(targetPath, safe || '.');
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+    try {
+      const IGNORE = new Set(['node_modules', '.git', 'dist', '.cache']);
+      const lines: string[] = [];
+      function listDir(dir: string, prefix: string, depth: number): void {
+        if (depth > 3) return;
+        let entries: string[];
+        try { entries = readdirSync(dir); } catch { return; }
+        for (const entry of entries.sort()) {
+          if (IGNORE.has(entry)) continue;
+          const full = join(dir, entry);
+          let st;
+          try { st = statSync(full); } catch { continue; }
+          if (st.isDirectory()) {
+            lines.push(`${prefix}${entry}/`);
+            listDir(full, `${prefix}  `, depth + 1);
+          } else {
+            lines.push(`${prefix}${entry}`);
+          }
+        }
+      }
+      listDir(abs, '', 0);
+      return lines.length > 0 ? lines.join('\n') : '(empty directory)';
+    } catch (e) {
+      return `Error listing ${dirPath}: ${e}`;
+    }
+  }
+
+  if (toolName === 'search_code') {
+    const pattern = String(input.pattern ?? '').trim();
+    if (!pattern) return 'Error: pattern is required';
+    const searchPath = input.path ? String(input.path).trim() : '';
+    const safe = searchPath ? searchPath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '') : '';
+    const abs = resolve(targetPath, safe || '.');
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+    try {
+      const IGNORE = new Set(['node_modules', '.git', 'dist']);
+      const matches: string[] = [];
+      const regex = new RegExp(pattern, 'i');
+      function searchDir(dir: string): void {
+        let entries: string[];
+        try { entries = readdirSync(dir); } catch { return; }
+        for (const entry of entries) {
+          if (IGNORE.has(entry)) continue;
+          const full = join(dir, entry);
+          let st;
+          try { st = statSync(full); } catch { continue; }
+          if (st.isDirectory()) {
+            searchDir(full);
+          } else if (st.isFile() && st.size < 500_000) {
+            try {
+              const text = readFileSync(full, 'utf-8');
+              const lines = text.split('\n');
+              for (let i = 0; i < lines.length; i++) {
+                if (regex.test(lines[i])) {
+                  const rel = relative(targetPath, full).replace(/\\/g, '/');
+                  matches.push(`${rel}:${i + 1}: ${lines[i].trim()}`);
+                  if (matches.length >= 50) return;
+                }
+              }
+            } catch { /* skip binary/unreadable files */ }
+          }
+        }
+      }
+      searchDir(abs);
+      return matches.length > 0 ? matches.join('\n') : `No matches found for: ${pattern}`;
+    } catch (e) {
+      return `Error searching: ${e}`;
+    }
+  }
+
+  if (toolName === 'delete_file') {
+    const filePath = String(input.path ?? '').trim();
+    if (!filePath) return 'Error: path is required';
+    const safe = filePath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    const abs = resolve(targetPath, safe);
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+    try {
+      if (!existsSync(abs)) return `Error: ${safe} does not exist`;
+      rmSync(abs);
+      logger.info({ path: safe, targetPath }, 'File deleted by agent');
+      return `OK: ${safe} deleted`;
+    } catch (e) {
+      return `Error deleting ${safe}: ${e}`;
+    }
+  }
+
+  if (toolName === 'create_directory') {
+    const dirPath = String(input.path ?? '').trim();
+    if (!dirPath) return 'Error: path is required';
+    const safe = dirPath.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
+    const abs = resolve(targetPath, safe);
+    if (!abs.startsWith(resolve(targetPath))) return 'Error: path traversal denied';
+    try {
+      mkdirSync(abs, { recursive: true });
+      return `OK: ${safe} created`;
+    } catch (e) {
+      return `Error creating ${safe}: ${e}`;
     }
   }
 
@@ -180,24 +361,24 @@ function extractFiles(
   return files;
 }
 
-function writeFiles(repoPath: string, files: Array<{ path: string; code: string }>): string[] {
+function writeFiles(repoPath: string, files: Array<{ path: string; code: string }>): { written: string[]; failed: string[] } {
   const written: string[] = [];
+  const failed: string[] = [];
   for (const file of files) {
-    // Sanitize path: strip leading slashes / drive letters to prevent path traversal
     const safePath = file.path.replace(/^[/\\]+/, '').replace(/^[a-zA-Z]:[\\/]?/, '');
     if (!safePath) continue;
     const absPath = resolve(repoPath, safePath);
-    // Ensure it's within repoPath
     if (!absPath.startsWith(resolve(repoPath))) continue;
     try {
       mkdirSync(dirname(absPath), { recursive: true });
       writeFileSync(absPath, file.code, 'utf-8');
       written.push(safePath);
-    } catch {
-      // ignore individual file write errors
+    } catch (err) {
+      logger.error({ err: String(err), path: safePath }, 'Failed to write file');
+      failed.push(safePath);
     }
   }
-  return written;
+  return { written, failed };
 }
 
 /** Build system prompt that instructs agent to output files in parseable format */
@@ -347,14 +528,9 @@ async function classifyIntent(
     // LLM failed — fall through to keyword result
   }
 
-  // 3. Final fallback: use keyword result even if uncertain, bias toward directive if any signal
+  // 3. Final fallback: only treat as directive if keyword match was definitive
+  // Default to chat to avoid accidental orchestration on ambiguous input
   if (kwResult.intent === 'directive') return { intent: 'directive', confidence: 0.5 };
-
-  // If truly ambiguous and message is long (>20 chars), lean toward directive
-  if (message.length > 20 && kwResult.intent === 'uncertain') {
-    return { intent: 'directive', confidence: 0.45 };
-  }
-
   return { intent: 'chat', confidence: 0.5 };
 }
 
@@ -528,7 +704,7 @@ async function pmReview(
   pmAgent: Agent,
   subtask: { title: string; description: string },
   agentOutput: string,
-): Promise<{ decision: 'APPROVE' | 'REVISE'; feedback: string }> {
+): Promise<{ decision: 'APPROVE' | 'REVISE' | 'BLOCKED'; feedback: string }> {
   const prompt = PM_REVIEW_PROMPT
     .replace('{TITLE}', subtask.title)
     .replace('{DESCRIPTION}', subtask.description)
@@ -555,7 +731,8 @@ async function pmReview(
       return { decision: 'APPROVE', feedback: '' };
     }
   } catch {
-    // PM review failed — approve to avoid infinite loop
+    // PM review failed — block task rather than silently passing bad work
+    return { decision: 'BLOCKED', feedback: 'PM review unavailable (provider error). Task blocked to prevent passing incomplete work.' };
   }
   return { decision: 'APPROVE', feedback: '' };
 }
@@ -564,13 +741,47 @@ async function pmReview(
 
 const MAX_REVIEW_CYCLES = 3;
 
+/** Build topological layers for parallel execution based on title-based dependencies */
+function buildDAGLayers<T extends { id: string; title: string; dependencies?: string[] }>(
+  subtasks: T[],
+): T[][] {
+  const titleToId = new Map(subtasks.map((t) => [t.title, t.id]));
+  const done = new Set<string>();
+  const remaining = new Set(subtasks.map((t) => t.id));
+  const layers: Array<typeof subtasks> = [];
+
+  while (remaining.size > 0) {
+    const layer: typeof subtasks = [];
+    for (const taskId of remaining) {
+      const task = subtasks.find((t) => t.id === taskId)!;
+      const depIds = (task.dependencies ?? [])
+        .map((depTitle) => titleToId.get(depTitle))
+        .filter((id): id is string => id !== undefined);
+      if (depIds.every((depId) => done.has(depId))) {
+        layer.push(task);
+      }
+    }
+    // Cycle guard: if no task is ready, a circular dependency exists — fail fast
+    if (layer.length === 0) {
+      const cycleIds = [...remaining].join(', ');
+      throw new Error(`Circular dependency detected among tasks: ${cycleIds}`);
+    }
+    for (const task of layer) {
+      remaining.delete(task.id);
+      done.add(task.id);
+    }
+    layers.push(layer);
+  }
+  return layers;
+}
+
 async function executeSubtasks(
   db: ServerDatabase,
   wss: WebSocketManager | undefined,
   projectId: string,
   chatFn: GatewayChatFn,
   agents: Agent[],
-  subtasks: Array<{ id: string; assigneeAgentId?: string; title: string; description: string }>,
+  subtasks: Array<{ id: string; assigneeAgentId?: string; title: string; description: string; dependencies?: string[] }>,
   skillLoader?: SkillLoader,
   pmAgent?: Agent,
   chatHistory?: Array<{ role: string; content: string; sender?: string; timestamp: string }>,
@@ -584,8 +795,8 @@ async function executeSubtasks(
   let failedCount = 0;
   const targetPath = repoPath ?? process.cwd();
 
-  for (let idx = 0; idx < subtasks.length; idx++) {
-    const subtask = subtasks[idx];
+  // ── Single task executor (extracted from loop body) ───────────────────
+  async function executeOneTask(subtask: typeof subtasks[number]): Promise<void> {
     let agent = currentAgents.find((a) => a.id === subtask.assigneeAgentId);
 
     if (!agent && subtask.assigneeAgentId) {
@@ -604,7 +815,7 @@ async function executeSubtasks(
 
     broadcastChatStatus(
       wss, projectId,
-      `[${idx + 1}/${total}] **${subtask.title}** 시작 → ${agent.name}`,
+      `▶ **${subtask.title}** 시작 → ${agent.name}`,
       pmName, chatHistory,
     );
 
@@ -622,9 +833,11 @@ async function executeSubtasks(
         ? { tools: selectedSkills, tool_choice: 'auto' as const }
         : undefined;
 
+      const rolePrompt = ROLE_PROMPTS[agent.role] ?? ROLE_PROMPTS.DEVELOPER;
+      const toolInstruction = 'IMPORTANT: Use the write_file tool to create ALL files. Do not output code in text.';
       const effectiveSystemPrompt = agent.systemPrompt
-        ? `${agent.systemPrompt}\n\nIMPORTANT: Use the write_file tool to create ALL files. Do not output code in text.`
-        : 'IMPORTANT: Use the write_file tool to create ALL files. Do not output code in text — call write_file for each file.';
+        ? `${rolePrompt}\n\n${agent.systemPrompt}\n\n${toolInstruction}`
+        : `${rolePrompt}\n\n${toolInstruction}`;
 
       // ── Agentic tool execution loop ─────────────────────────────
       // Each "round" = one LLM call + all resulting tool executions
@@ -637,7 +850,7 @@ async function executeSubtasks(
       let currentUserMsg = subtask.description;
 
       while (!approved && reviewCycle < MAX_REVIEW_CYCLES) {
-        const agentMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
+        const agentMessages: ChatMessage[] = [
           { role: 'user', content: currentUserMsg },
         ];
 
@@ -646,6 +859,17 @@ async function executeSubtasks(
         const TOOL_LOOP_LIMIT = 8;
         let toolLoopCount = 0;
         let roundWritten: string[] = [];
+
+        // Stream text chunks back to UI as agent:thinking events
+        const thinkingOnChunk = wss
+          ? (chunk: string) => {
+              wss.broadcastToProject(projectId, {
+                type: 'agent:thinking' as never,
+                timestamp: new Date().toISOString(),
+                payload: { agentId: agent.id, taskId: subtask.id, chunk },
+              });
+            }
+          : undefined;
 
         while (toolLoopCount < TOOL_LOOP_LIMIT) {
           const toolsForAgent = [...FILE_TOOLS, ...(selectedSkills ?? [])];
@@ -656,19 +880,34 @@ async function executeSubtasks(
               agent.model,
               agentMessages,
               effectiveSystemPrompt,
-              { tools: toolsForAgent, tool_choice: 'auto' },
+              { tools: toolsForAgent, tool_choice: 'auto', ...(thinkingOnChunk ? { onChunk: thinkingOnChunk } : {}) },
             );
           } catch (toolErr) {
-            // Model doesn't support tools — fall back to text
-            if (/does not support tools|tool.*not.*support|function.*call|tools.*not.*supported/i.test(String(toolErr))) {
+            const toolErrStr = String(toolErr);
+            // Model doesn't support tools — fall back to text-only on same provider
+            if (/does not support tools|tool.*not.*support|function.*call|tools.*not.*supported/i.test(toolErrStr)) {
               response = await chatFn(
                 agent.provider,
                 agent.model,
                 agentMessages,
                 effectiveSystemPrompt,
+                thinkingOnChunk ? { onChunk: thinkingOnChunk } : undefined,
               );
             } else {
-              throw toolErr;
+              // Try agent's fallback provider/model if configured
+              const fallbackProvider = agent.metadata?.fallbackProvider as string | undefined;
+              const fallbackModel = agent.metadata?.fallbackModel as string | undefined;
+              if (fallbackProvider && fallbackModel) {
+                response = await chatFn(
+                  fallbackProvider,
+                  fallbackModel,
+                  agentMessages,
+                  effectiveSystemPrompt,
+                  { tools: toolsForAgent, tool_choice: 'auto', ...(thinkingOnChunk ? { onChunk: thinkingOnChunk } : {}) },
+                );
+              } else {
+                throw toolErr;
+              }
             }
           }
 
@@ -677,19 +916,39 @@ async function executeSubtasks(
           // Execute tool calls
           const toolUse = (response as ExtendedChatResponse).toolUse;
           if (toolUse && toolUse.length > 0) {
-            const toolResults: string[] = [];
+            // Execute each tool and collect results
+            const toolResultBlocks: ContentBlock[] = [];
             for (const tool of toolUse) {
               const result = executeToolCall(tool.name, tool.input, targetPath, roundWritten);
-              toolResults.push(`[${tool.name}(${JSON.stringify(tool.input.path ?? tool.input)})] → ${result}`);
+              const isError = result.startsWith('Error');
+              toolResultBlocks.push({ type: 'tool_result', tool_use_id: tool.id, content: result, is_error: isError });
+              // Log tool call to DB (best-effort)
+              if (db.logToolCall) {
+                db.logToolCall({ taskId: subtask.id, agentId: agent.id, toolName: tool.name, input: tool.input, result, isError }).catch(() => {});
+              }
             }
             writtenFiles.push(...roundWritten);
 
-            // Feed results back to agent (text-based tool result — works with all providers)
-            agentMessages.push({ role: 'assistant', content: lastResponse || '(tool calls executed)' });
-            agentMessages.push({
-              role: 'user',
-              content: `Tool execution results:\n${toolResults.join('\n')}\n\nContinue if more files needed, or respond "done" when complete.`,
-            });
+            // Assistant message: text (if any) + tool_use blocks — required by Anthropic API
+            const assistantContent: ContentBlock[] = [];
+            if (lastResponse) assistantContent.push({ type: 'text', text: lastResponse });
+            for (const tool of toolUse) {
+              assistantContent.push({ type: 'tool_use', id: tool.id, name: tool.name, input: tool.input });
+            }
+            agentMessages.push({ role: 'assistant', content: assistantContent });
+            // User message: tool_result blocks
+            agentMessages.push({ role: 'user', content: toolResultBlocks });
+            // Context window protection: trim if message history is growing large
+            if (agentMessages.length > 6) {
+              const estimatedTokens = agentMessages.reduce((sum, m) => {
+                const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+                return sum + Math.ceil(text.length / 4);
+              }, 0);
+              if (estimatedTokens > getContextLimit(agent.model) * 0.8) {
+                // Keep first user message + most recent 4 messages
+                agentMessages.splice(1, agentMessages.length - 5);
+              }
+            }
             toolLoopCount++;
           } else {
             // No tool calls — agent is done with this round
@@ -701,7 +960,11 @@ async function executeSubtasks(
         // Regex fallback: if no files written via tools, try to parse text
         if (writtenFiles.length === 0 && lastResponse.length > 50) {
           const textFiles = extractFiles(lastResponse, subtask.title);
-          writtenFiles.push(...writeFiles(targetPath, textFiles));
+          const { written: tw, failed: tf } = writeFiles(targetPath, textFiles);
+          writtenFiles.push(...tw);
+          if (tf.length > 0) {
+            broadcastChatStatus(wss, projectId, `⚠ 파일 쓰기 실패: ${tf.join(', ')}`, pmName, chatHistory);
+          }
         }
 
         // ── PM review ─────────────────────────────────────────
@@ -725,7 +988,10 @@ async function executeSubtasks(
           const pmIdle = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.IDLE });
           broadcastAgentUpdate(wss, projectId, pmIdle);
 
-          if (review.decision === 'APPROVE') {
+          if (review.decision === 'BLOCKED') {
+            // PM review provider unavailable — fail safe
+            throw new Error(review.feedback);
+          } else if (review.decision === 'APPROVE') {
             approved = true;
             broadcastChatStatus(
               wss, projectId,
@@ -758,9 +1024,6 @@ async function executeSubtasks(
       const idle = await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE });
       broadcastAgentUpdate(wss, projectId, idle);
 
-      doneCount++;
-
-      const preview = lastResponse.length > 120 ? lastResponse.slice(0, 120) + '...' : lastResponse;
       const filesSummary = writtenFiles.length > 0
         ? `\n📁 파일 저장: ${writtenFiles.join(', ')}`
         : '';
@@ -777,13 +1040,42 @@ async function executeSubtasks(
       const idle = await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE });
       broadcastAgentUpdate(wss, projectId, idle);
 
-      failedCount++;
       const errMsg = String(err).length > 100 ? String(err).slice(0, 100) + '...' : String(err);
       broadcastChatStatus(
         wss, projectId,
         `✗ **${subtask.title}** 실패 (${agent.name})\n${errMsg}`,
         pmName, chatHistory,
       );
+      throw err; // re-throw so caller can count failures
+    }
+  }
+  // ── End executeOneTask ────────────────────────────────────────────────
+
+  // ── Execute tasks in DAG-ordered parallel layers ──────────────────────
+  const MAX_CONCURRENT = 5;
+  let layers: (typeof subtasks)[];
+  try {
+    layers = buildDAGLayers(subtasks);
+  } catch (cycleErr) {
+    logger.error({ err: String(cycleErr), projectId }, 'DAG cycle detected — marking all pending tasks FAILED');
+    await Promise.all(subtasks.map((t) =>
+      db.updateTask(t.id, { status: 'FAILED' as import('@mct-madev/core').TaskStatus, error: `Dependency cycle: ${cycleErr}` }).catch(() => {}),
+    ));
+    broadcastChatStatus(wss, projectId, `오류: 태스크 간 순환 의존성이 감지되어 실행을 중단했습니다.`, pmName, chatHistory);
+    return;
+  }
+
+  for (const layer of layers) {
+    for (let i = 0; i < layer.length; i += MAX_CONCURRENT) {
+      const batch = layer.slice(i, i + MAX_CONCURRENT);
+      const results = await Promise.allSettled(batch.map((task) => withTaskTimeout(executeOneTask(task))));
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          doneCount++;
+        } else {
+          failedCount++;
+        }
+      }
     }
   }
 
@@ -847,31 +1139,64 @@ Be concrete and specific. Base the guide on the actual files that exist.`;
 
   const writtenExtra: string[] = [];
   try {
-    const response = await chatFn(
-      pmAgent.provider,
-      pmAgent.model,
-      [{ role: 'user', content: finalizationPrompt }],
-      'You are a helpful project manager. Use write_file for each file you create.',
-      { tools: FILE_TOOLS, tool_choice: 'auto' },
-    );
+    const pmSystemPrompt = 'You are a helpful project manager. Use write_file for each file you create. Always call write_file to create HOW_TO_RUN.md.';
+    const finalMessages: ChatMessage[] = [{ role: 'user', content: finalizationPrompt }];
 
-    const toolUse = (response as ExtendedChatResponse).toolUse;
-    if (toolUse && toolUse.length > 0) {
-      for (const tool of toolUse) {
-        executeToolCall(tool.name, tool.input, targetPath, writtenExtra);
+    // ── Agentic loop: handle tool calls from PM ──────────────────
+    const FINALIZE_LOOP_LIMIT = 6;
+    let lastTextContent = '';
+    for (let loop = 0; loop < FINALIZE_LOOP_LIMIT; loop++) {
+      let response: ExtendedChatResponse | Awaited<ReturnType<GatewayChatFn>>;
+      try {
+        response = await chatFn(
+          pmAgent.provider,
+          pmAgent.model,
+          finalMessages,
+          pmSystemPrompt,
+          { tools: FILE_TOOLS, tool_choice: 'auto' },
+        );
+      } catch {
+        // Provider doesn't support tools — fall back to plain text call
+        response = await chatFn(pmAgent.provider, pmAgent.model, finalMessages, pmSystemPrompt);
+      }
+
+      if (response.content) lastTextContent = response.content;
+
+      const toolUse = (response as ExtendedChatResponse).toolUse;
+      if (toolUse && toolUse.length > 0) {
+        // Execute all tool calls
+        const toolResultBlocks: ContentBlock[] = [];
+        for (const tool of toolUse) {
+          const result = executeToolCall(tool.name, tool.input, targetPath, writtenExtra);
+          toolResultBlocks.push({ type: 'tool_result', tool_use_id: tool.id, content: result });
+        }
+        // Add assistant + tool_result messages for next turn
+        const assistantBlocks: ContentBlock[] = [];
+        if (response.content) assistantBlocks.push({ type: 'text', text: response.content });
+        for (const tool of toolUse) {
+          assistantBlocks.push({ type: 'tool_use', id: tool.id, name: tool.name, input: tool.input });
+        }
+        finalMessages.push({ role: 'assistant', content: assistantBlocks });
+        finalMessages.push({ role: 'user', content: toolResultBlocks });
+      } else {
+        // No more tool calls — PM is done
+        break;
       }
     }
 
-    // If HOW_TO_RUN.md not created via tool, extract from text
+    // ── Ensure HOW_TO_RUN.md exists ──────────────────────────────
     const howToRunExists = allFiles.some((f) => /HOW_TO_RUN|README/i.test(f)) ||
       writtenExtra.some((f) => /HOW_TO_RUN|README/i.test(f));
-    if (!howToRunExists && response.content && response.content.length > 100) {
-      // PM wrote the guide as text — save it
-      const guideFiles = extractFiles(response.content);
-      writeFiles(targetPath, guideFiles);
-      if (guideFiles.length === 0) {
-        // Just save the raw response as HOW_TO_RUN.md
-        writeFiles(targetPath, [{ path: 'HOW_TO_RUN.md', code: response.content }]);
+
+    if (!howToRunExists) {
+      if (lastTextContent.length > 50) {
+        // Write PM's text response directly as HOW_TO_RUN.md
+        writeFiles(targetPath, [{ path: 'HOW_TO_RUN.md', code: lastTextContent }]);
+        writtenExtra.push('HOW_TO_RUN.md');
+      } else {
+        const fileList = [...allFiles, ...writtenExtra].join('\n  - ');
+        const minimal = `# How to Run\n\nThis project was generated by MCT-MADEV.\n\n## Project Files\n\n  - ${fileList}\n\n## Getting Started\n\n1. Install dependencies: \`npm install\` or \`pnpm install\`\n2. Start development: \`npm run dev\` or \`pnpm dev\`\n3. Build: \`npm run build\` or \`pnpm build\`\n`;
+        writeFiles(targetPath, [{ path: 'HOW_TO_RUN.md', code: minimal }]);
         writtenExtra.push('HOW_TO_RUN.md');
       }
     }
@@ -881,6 +1206,15 @@ Be concrete and specific. Base the guide on the actual files that exist.`;
       : `📋 PM 최종 검토 완료 — 프로젝트 구조가 완성되었습니다.\n실행 가이드: **HOW_TO_RUN.md**`;
 
     broadcastChatStatus(wss, projectId, finalMsg, pmName, chatHistory);
+
+    // Broadcast orchestration:complete event so UI can react without string parsing
+    if (wss) {
+      wss.broadcastToProject(projectId, {
+        type: 'orchestration:complete' as never,
+        timestamp: new Date().toISOString(),
+        payload: { projectId },
+      });
+    }
   } finally {
     const pmIdle = await db.updateAgent(pmAgent.id, { visualState: AgentVisualState.IDLE });
     broadcastAgentUpdate(wss, pmAgent.projectId ?? projectId, pmIdle);
@@ -909,20 +1243,81 @@ function collectProjectFiles(dir: string, rel = ''): string[] {
   return results;
 }
 
+// ── Per-model context window limits (in tokens) ─────────────────────────────
+const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+  'claude-opus-4-6': 180_000,
+  'claude-sonnet-4-6': 180_000,
+  'claude-haiku-4-5-20251001': 180_000,
+  'gpt-4o': 120_000,
+  'gpt-4o-mini': 120_000,
+  'gpt-4-turbo': 120_000,
+  'gemini-2.5-pro': 900_000,
+  'gemini-2.5-flash': 900_000,
+  'gemini-1.5-pro': 900_000,
+  'gemini-1.5-flash': 900_000,
+};
+const DEFAULT_CONTEXT_LIMIT = 100_000;
+
+function getContextLimit(model?: string): number {
+  if (!model) return DEFAULT_CONTEXT_LIMIT;
+  // Try exact match first, then prefix match
+  if (MODEL_CONTEXT_LIMITS[model]) return MODEL_CONTEXT_LIMITS[model];
+  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
+    if (model.startsWith(key) || key.startsWith(model)) return limit;
+  }
+  return DEFAULT_CONTEXT_LIMIT;
+}
+
+// ── Per-task timeout helper ──────────────────────────────────────────────────
+const TASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per task
+
+function withTaskTimeout<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Task timed out after ${TASK_TIMEOUT_MS / 60_000} minutes`)), TASK_TIMEOUT_MS),
+    ),
+  ]);
+}
+
 // ── Router ──
+// Track active orchestrations per project (prevent concurrent runs)
+const runningOrchestrations = new Set<string>();
+// Last directive message per project (for retry)
+const lastDirectives = new Map<string, string>();
+
+const HISTORY_MAX_ENTRIES = 500;
+
 export function createChatRouter(): Router {
   const router = Router();
 
-  // Chat history per project
+  // Chat history per project (LRU: max 50 projects)
   const chatHistories = new Map<string, Array<{ role: string; content: string; sender?: string; timestamp: string }>>();
+  function getOrCreateHistory(projectId: string) {
+    if (chatHistories.has(projectId)) {
+      // Promote to most-recently-used by re-inserting
+      const existing = chatHistories.get(projectId)!;
+      chatHistories.delete(projectId);
+      chatHistories.set(projectId, existing);
+      return existing;
+    }
+    if (chatHistories.size >= 50) {
+      const lruKey = chatHistories.keys().next().value;
+      if (lruKey) chatHistories.delete(lruKey);
+    }
+    const history: Array<{ role: string; content: string; sender?: string; timestamp: string }> = [];
+    chatHistories.set(projectId, history);
+    return history;
+  }
 
   // POST /projects/:projectId/chat
   router.post('/projects/:projectId/chat', async (req: Request, res: Response) => {
+    const projectId = param(req, 'projectId');
+    let backgroundStarted = false; // tracks if background task owns the orchestration lock
     try {
       const db = getDb(req);
       const wss = getWss(req);
       const chatFn = getChatFn(req);
-      const projectId = param(req, 'projectId');
       const { message } = req.body;
 
       if (!message || typeof message !== 'string') {
@@ -935,6 +1330,13 @@ export function createChatRouter(): Router {
         return;
       }
 
+      // Prevent concurrent orchestrations for the same project
+      if (runningOrchestrations.has(projectId)) {
+        res.status(409).json({ error: 'ORCHESTRATION_RUNNING', message: '이미 실행 중인 오케스트레이션이 있습니다.' });
+        return;
+      }
+      runningOrchestrations.add(projectId);
+
       const agents = await db.listAgents(projectId);
       const pmAgent = agents.find((a) => a.role === 'PM');
       if (!pmAgent) {
@@ -942,13 +1344,13 @@ export function createChatRouter(): Router {
         return;
       }
 
-      // Get or create chat history
-      if (!chatHistories.has(projectId)) chatHistories.set(projectId, []);
-      const history = chatHistories.get(projectId)!;
+      // Get or create chat history (LRU-bounded)
+      const history = getOrCreateHistory(projectId);
 
       // Add user message
       const userMsg = { role: 'user', content: message, sender: 'CEO', timestamp: new Date().toISOString() };
       history.push(userMsg);
+      if (history.length > HISTORY_MAX_ENTRIES) history.splice(0, history.length - HISTORY_MAX_ENTRIES);
 
       // User message is added optimistically by the client — no broadcast needed
 
@@ -979,8 +1381,9 @@ export function createChatRouter(): Router {
         responseContent = response.content;
       } else {
         // ── Directive mode: decompose and execute ──
+        lastDirectives.set(projectId, message);
         const pm = new PMAgent();
-        const pmChatFn = async (msgs: { role: string; content: string }[]) => {
+        const pmChatFn = async (msgs: ChatMessage[]) => {
           const result = await chatFn(pmAgent.provider, pmAgent.model, msgs as never, pmAgent.systemPrompt);
           return result as import('@mct-madev/core').ChatResponse;
         };
@@ -1044,7 +1447,7 @@ export function createChatRouter(): Router {
             status: TaskStatus.CREATED,
             assigneeAgentId: assignee?.id,
             priority: sub.priority,
-            dependencies: [],
+            dependencies: sub.dependencies ?? [],
             metadata: { parentDirective: rootTask.id },
           });
           broadcastTaskUpdate(wss, projectId, subtask);
@@ -1062,11 +1465,23 @@ export function createChatRouter(): Router {
         const taskList = subtasks.map((s) => `  - ${s.title} → ${s.assigneeName ?? 'unassigned'}`).join('\n');
         responseContent = `업무를 ${subtasks.length}개 하위 작업으로 분해했습니다. 실행을 시작합니다.\n\n${taskList}`;
 
-        // Execute asynchronously
+        // Execute asynchronously — background owns the orchestration lock
+        backgroundStarted = true;
         const skillLoader = getSkillLoader(req);
         const project = await db.getProject(projectId);
         const repoPath = project?.repoPath;
-        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, repoPath).catch(() => {});
+        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, repoPath)
+          .catch((err) => {
+            logger.error({ err: String(err), projectId }, 'Orchestration execution failed');
+            if (wss) {
+              wss.broadcastToProject(projectId, {
+                type: 'orchestration:error' as never,
+                timestamp: new Date().toISOString(),
+                payload: { projectId, error: 'Orchestration failed unexpectedly. Check server logs.' },
+              });
+            }
+          })
+          .finally(() => { runningOrchestrations.delete(projectId); });
       }
 
       // PM back to idle
@@ -1076,6 +1491,7 @@ export function createChatRouter(): Router {
       // Save assistant message
       const assistantMsg = { role: 'assistant', content: responseContent, sender: pmAgent.name, timestamp: new Date().toISOString() };
       history.push(assistantMsg);
+      if (history.length > HISTORY_MAX_ENTRIES) history.splice(0, history.length - HISTORY_MAX_ENTRIES);
 
       // Broadcast to UI
       if (wss) {
@@ -1105,6 +1521,9 @@ export function createChatRouter(): Router {
         hint = ' (네트워크 오류. Ollama나 외부 API 서버를 확인하세요.)';
       }
       res.status(500).json({ error: `Chat failed${hint}`, detail });
+    } finally {
+      // Only release the lock here if background execution didn't take ownership
+      if (!backgroundStarted) runningOrchestrations.delete(projectId);
     }
   });
 
@@ -1120,6 +1539,92 @@ export function createChatRouter(): Router {
     const projectId = param(req, 'projectId');
     chatHistories.delete(projectId);
     res.json({ message: 'Chat history cleared' });
+  });
+
+  // POST /projects/:projectId/chat/retry — re-run last failed directive
+  router.post('/projects/:projectId/chat/retry', async (req: Request, res: Response) => {
+    const projectId = param(req, 'projectId');
+    const lastMessage = lastDirectives.get(projectId);
+    if (!lastMessage) {
+      res.status(404).json({ error: 'No previous directive to retry' });
+      return;
+    }
+    if (runningOrchestrations.has(projectId)) {
+      res.status(409).json({ error: 'ORCHESTRATION_RUNNING', message: '이미 실행 중인 오케스트레이션이 있습니다.' });
+      return;
+    }
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const chatFn = getChatFn(req);
+      if (!chatFn) { res.status(500).json({ error: 'Chat function not available.' }); return; }
+
+      const agents = await db.listAgents(projectId);
+      const pmAgent = agents.find((a) => a.role === 'PM');
+      if (!pmAgent) { res.status(400).json({ error: 'No PM agent found.' }); return; }
+
+      runningOrchestrations.add(projectId);
+
+      const history = getOrCreateHistory(projectId);
+      const userMsg = { role: 'user', content: `[재시도] ${lastMessage}`, sender: 'CEO', timestamp: new Date().toISOString() };
+      history.push(userMsg);
+      if (history.length > HISTORY_MAX_ENTRIES) history.splice(0, history.length - HISTORY_MAX_ENTRIES);
+
+      const pm = new PMAgent();
+      const pmChatFn = async (msgs: ChatMessage[]) => {
+        const result = await chatFn(pmAgent.provider, pmAgent.model, msgs as never, pmAgent.systemPrompt);
+        return result as import('@mct-madev/core').ChatResponse;
+      };
+
+      const rootTask = await db.createTask({
+        projectId, title: `[재시도] ${lastMessage.slice(0, 80)}`, description: lastMessage,
+        status: TaskStatus.CREATED, assigneeAgentId: pmAgent.id, priority: 10,
+        dependencies: [], metadata: { type: 'directive', retry: true },
+      });
+
+      let subtaskDefs;
+      try {
+        subtaskDefs = await pm.decompose(rootTask as never, pmChatFn, agents.map((a) => ({ name: a.name, role: a.role, id: a.id })));
+      } catch (err) {
+        runningOrchestrations.delete(projectId);
+        await db.updateTask(rootTask.id, { status: TaskStatus.DONE, result: `Decompose failed: ${err}` });
+        res.status(500).json({ error: '재시도 계획 수립 실패', detail: String(err) });
+        return;
+      }
+
+      await db.updateTask(rootTask.id, { status: TaskStatus.DONE, result: JSON.stringify(subtaskDefs) });
+      const assignments = assignSubtasks(agents, subtaskDefs);
+      const createdSubtasks = [];
+      for (let i = 0; i < subtaskDefs.length; i++) {
+        const sub = subtaskDefs[i];
+        let assignee = assignments.get(i);
+        if (!assignee) {
+          assignee = await ensureAgentForRole(db, wss, projectId, detectNeededRole(sub), agents);
+          agents.push(assignee);
+        }
+        const subtask = await db.createTask({
+          projectId, parentTaskId: rootTask.id, title: sub.title, description: sub.description,
+          status: TaskStatus.CREATED, assigneeAgentId: assignee?.id, priority: sub.priority,
+          dependencies: sub.dependencies ?? [], metadata: { parentDirective: rootTask.id },
+        });
+        broadcastTaskUpdate(wss, projectId, subtask);
+        createdSubtasks.push({ ...subtask, assigneeName: assignee?.name });
+      }
+
+      res.status(202).json({ message: '재시도 오케스트레이션이 시작되었습니다.', subtasks: createdSubtasks.length });
+
+      const skillLoader = getSkillLoader(req);
+      const project = await db.getProject(projectId);
+      executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, project?.repoPath)
+        .catch((err) => {
+          logger.error({ err: String(err), projectId }, 'Retry orchestration failed');
+          if (wss) wss.broadcastToProject(projectId, { type: 'orchestration:error' as never, timestamp: new Date().toISOString(), payload: { projectId, error: 'Retry failed. Check server logs.' } });
+        })
+        .finally(() => { runningOrchestrations.delete(projectId); });
+    } catch (err) {
+      runningOrchestrations.delete(projectId);
+      res.status(500).json({ error: 'Retry failed', detail: String(err) });
+    }
   });
 
   return router;

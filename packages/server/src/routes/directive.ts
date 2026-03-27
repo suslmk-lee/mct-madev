@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { sendError } from '../routeError.js';
 import type { ServerDatabase } from '../database.js';
 import type { Agent, Task } from '@mct-madev/core';
 import type { WebSocketManager } from '../websocket/index.js';
@@ -12,6 +13,7 @@ import {
   type SkillDefinition,
   type ExtendedChatResponse,
   type ToolUseBlock,
+  type ChatMessage,
 } from '@mct-madev/core';
 
 function getDb(req: Request): ServerDatabase {
@@ -111,7 +113,7 @@ export function createDirectiveRouter(): Router {
 
       // PM decomposes directive into subtasks
       const pm = new PMAgent();
-      const pmChatFn = async (msgs: { role: string; content: string }[]) => {
+      const pmChatFn = async (msgs: ChatMessage[]) => {
         const result = await chatFn(pmAgent.provider, pmAgent.model, msgs as never, pmAgent.systemPrompt);
         return result as import('@mct-madev/core').ChatResponse;
       };
@@ -124,7 +126,7 @@ export function createDirectiveRouter(): Router {
           agents.map((a) => ({ name: a.name, role: a.role, id: a.id })),
         );
       } catch (err) {
-        const updated = await db.updateTask(rootTask.id, { status: TaskStatus.DONE, result: `PM could not decompose: ${err}` });
+        const updated = await db.updateTask(rootTask.id, { status: TaskStatus.FAILED, error: `PM could not decompose: ${err}` });
         broadcastTaskUpdate(wss, projectId, updated);
         await setAgentIdle(db, wss, projectId, pmAgent.id);
         res.json({ data: { rootTask: updated, subtasks: [], error: String(err) } });
@@ -140,8 +142,16 @@ export function createDirectiveRouter(): Router {
       });
       broadcastTaskUpdate(wss, projectId, updatedRoot);
 
-      // Batch-assign subtasks across agents evenly
-      const assignments = assignSubtasks(agents, subtaskDefs);
+      // Batch-assign subtasks — weighted by current IN_PROGRESS load from DB
+      const existingTasks = await db.listTasks(projectId);
+      const taskCounts = new Map<string, number>();
+      for (const a of agents) taskCounts.set(a.id, 0);
+      for (const t of existingTasks) {
+        if (t.status === TaskStatus.IN_PROGRESS && t.assigneeAgentId) {
+          taskCounts.set(t.assigneeAgentId, (taskCounts.get(t.assigneeAgentId) ?? 0) + 1);
+        }
+      }
+      const assignments = assignSubtasks(agents, subtaskDefs, taskCounts);
       const createdSubtasks = [];
       for (let i = 0; i < subtaskDefs.length; i++) {
         const sub = subtaskDefs[i];
@@ -173,7 +183,7 @@ export function createDirectiveRouter(): Router {
         },
       });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to process directive', detail: String(err) });
+      sendError(res, 500, 'Failed to process directive', err);
     }
   });
 
@@ -204,7 +214,7 @@ export function createDirectiveRouter(): Router {
         stats: { total: tasks.length, done, failed, inProgress, pending: tasks.length - done - failed - inProgress },
       });
     } catch (err) {
-      res.status(500).json({ error: 'Failed to get task status', detail: String(err) });
+      sendError(res, 500, 'Failed to get task status', err);
     }
   });
 
@@ -233,32 +243,38 @@ function detectBestRole(sub: { title: string; description: string }): string {
   return bestRole;
 }
 
+// 에이전트별 현재 IN_PROGRESS 태스크 수를 고려하여 가장 부하가 적은 에이전트를 선택
+function selectLeastLoadedAgent(candidates: Agent[], taskCounts: Map<string, number>): Agent | undefined {
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((min, a) =>
+    (taskCounts.get(a.id) ?? 0) < (taskCounts.get(min.id) ?? 0) ? a : min
+  );
+}
+
 function assignSubtasks(
   agents: Agent[],
   subtaskDefs: Array<{ title: string; description: string; assignee?: string }>,
+  taskCounts?: Map<string, number>,
 ): Map<number, Agent> {
   const result = new Map<number, Agent>();
   const workers = agents.filter((a) => a.role !== 'PM');
   if (workers.length === 0) return result;
 
+  // 세션 내 새로 할당된 태스크 수 추적 (DB 부하 + 현재 배치 부하 합산)
   const assignCount = new Map<string, number>();
-  for (const a of workers) assignCount.set(a.id, 0);
-
-  const agentsByRole = new Map<string, Agent[]>();
-  for (const a of workers) {
-    const list = agentsByRole.get(a.role) ?? [];
-    list.push(a);
-    agentsByRole.set(a.role, list);
-  }
+  for (const a of workers) assignCount.set(a.id, taskCounts?.get(a.id) ?? 0);
 
   for (let i = 0; i < subtaskDefs.length; i++) {
     const sub = subtaskDefs[i];
     const role = detectBestRole(sub);
-    let candidates = agentsByRole.get(role);
-    if (!candidates || candidates.length === 0) candidates = workers;
 
-    candidates.sort((a, b) => (assignCount.get(a.id) ?? 0) - (assignCount.get(b.id) ?? 0));
-    const picked = candidates[0];
+    // 역할 일치 후보 중 least-loaded 선택, 없으면 전체 workers 중 least-loaded 선택
+    const roleWorkers = workers.filter((a) => a.role === role);
+    const picked =
+      selectLeastLoadedAgent(roleWorkers, assignCount) ??
+      selectLeastLoadedAgent(workers, assignCount) ??
+      workers[0];
+
     result.set(i, picked);
     assignCount.set(picked.id, (assignCount.get(picked.id) ?? 0) + 1);
   }

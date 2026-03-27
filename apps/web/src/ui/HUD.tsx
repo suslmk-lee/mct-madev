@@ -1,4 +1,10 @@
 import { useStore } from '../store/useStore';
+import { useState, useEffect } from 'react';
+
+interface ProviderStatus {
+  name: string;
+  active: boolean;
+}
 
 export function HUD() {
   const connected = useStore((s) => s.connected);
@@ -14,6 +20,23 @@ export function HUD() {
   const setSelectedAgentId = useStore((s) => s.setSelectedAgentId);
   const cameraPreset = useStore((s) => s.cameraPreset);
   const setCameraPreset = useStore((s) => s.setCameraPreset);
+  const apiError = useStore((s) => s.apiError);
+  const setApiError = useStore((s) => s.setApiError);
+
+  const [providers, setProviders] = useState<ProviderStatus[]>([]);
+
+  const fetchProviders = () => {
+    fetch('/api/providers')
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d?.providers) setProviders(d.providers); })
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetchProviders();
+    const id = setInterval(fetchProviders, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   const statusColor = projectStatus === 'ACTIVE' ? '#44CC66' : projectStatus === 'SUSPENDED' ? '#ffaa44' : projectStatus === 'CLOSED' ? '#888' : '#44CC66';
   const statusLabel = projectStatus === 'SUSPENDED' ? '일시중지' : projectStatus === 'CLOSED' ? '종료' : '';
@@ -30,6 +53,21 @@ export function HUD() {
 
   return (
     <div className="fixed top-0 left-0 right-0 z-10 pointer-events-none">
+      {apiError && (
+        <div style={{
+          background: 'rgba(200,60,60,0.92)',
+          color: '#fff',
+          fontSize: 12,
+          padding: '6px 16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          pointerEvents: 'auto',
+        }}>
+          <span>⚠ {apiError}</span>
+          <button onClick={() => setApiError(null)} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}>✕</button>
+        </div>
+      )}
       <div className="flex items-center justify-between px-5 py-3">
         {/* Left: Project info */}
         <div className="pointer-events-auto flex items-center gap-3">
@@ -124,6 +162,34 @@ export function HUD() {
             <span className="text-gray-300 font-bold text-base">{tasks.length}</span>
             <span className="text-gray-500">Total</span>
           </div>
+          {providers.filter((p) => p.active).length > 0 && (
+            <>
+              <div style={{ width: 1, height: 24, background: 'rgba(255,255,255,0.08)' }} />
+              <div className="flex gap-1.5 items-center">
+                {providers.filter((p) => p.active).map((p) => (
+                  <span
+                    key={p.name}
+                    title={`${p.name} API key active`}
+                    style={{
+                      fontSize: 9, padding: '2px 5px', borderRadius: 4, fontWeight: 600,
+                      background: 'rgba(68,204,102,0.12)', color: '#44CC66',
+                      border: '1px solid rgba(68,204,102,0.3)',
+                      textTransform: 'capitalize',
+                    }}
+                  >
+                    {p.name.slice(0, 3).toUpperCase()} ✓
+                  </span>
+                ))}
+                <button
+                  onClick={fetchProviders}
+                  title="Refresh provider status"
+                  style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.3)', cursor: 'pointer', fontSize: 10, padding: '0 2px', lineHeight: 1 }}
+                >
+                  ↻
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
 

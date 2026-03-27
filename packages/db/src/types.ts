@@ -7,6 +7,8 @@ import type {
   TaskFilter,
   TokenUsageInput,
   TokenUsageSummary,
+  ToolCallEntry,
+  ToolCallInput,
 } from './models.js';
 
 export interface IDatabase {
@@ -30,7 +32,8 @@ export interface IDatabase {
   // Tasks
   createTask(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt'>): Promise<Task>;
   getTask(id: string): Promise<Task | null>;
-  listTasks(projectId: string, filters?: TaskFilter): Promise<Task[]>;
+  listTasks(projectId: string, filters?: TaskFilter, pagination?: { limit?: number; offset?: number }): Promise<Task[]>;
+  countTasks(projectId: string, filters?: TaskFilter): Promise<number>;
   updateTask(id: string, updates: Partial<Task>): Promise<Task>;
 
   // Workflows
@@ -41,11 +44,15 @@ export interface IDatabase {
 
   // Messages & Logs
   createMessage(msg: MessageInput): Promise<Message>;
-  listMessages(taskId: string): Promise<Message[]>;
+  listMessages(taskId: string, limit?: number): Promise<Message[]>;
   createLog(log: LogInput): Promise<void>;
   listLogs(projectId: string, limit?: number): Promise<LogEntry[]>;
 
   // Token usage
   recordTokenUsage(usage: TokenUsageInput): Promise<void>;
   getTokenUsage(projectId: string): Promise<TokenUsageSummary>;
+
+  // Tool call logging
+  logToolCall(entry: ToolCallInput): Promise<ToolCallEntry>;
+  getToolCalls(taskId: string): Promise<ToolCallEntry[]>;
 }

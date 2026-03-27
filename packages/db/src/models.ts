@@ -42,3 +42,16 @@ export interface TaskFilter {
 
 export type MessageInput = Omit<Message, 'id' | 'createdAt'>;
 export type LogInput = Omit<LogEntry, 'id' | 'createdAt'>;
+
+export interface ToolCallEntry {
+  id: string;
+  taskId: string;
+  agentId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  result: string;
+  isError: boolean;
+  createdAt: string;
+}
+
+export type ToolCallInput = Omit<ToolCallEntry, 'id' | 'createdAt'>;

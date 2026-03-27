@@ -5,12 +5,16 @@ const WS_URL = `ws://${window.location.hostname}:${window.location.port || '3000
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempt = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const { setConnected, setAgents, updateAgent, removeAgent, setTasks, updateTask, setCurrentHour, addChatMessage, addLogEntry } =
+  const { setConnected, setAgents, updateAgent, removeAgent, setTasks, updateTask, setCurrentHour, addChatMessage, addLogEntry, appendAgentThinking, clearAgentThinking } =
     useStore();
   const currentProjectId = useStore((s) => s.currentProjectId);
 
@@ -43,8 +47,10 @@ export function useWebSocket() {
 
       ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data);
-          handleMessage(msg);
+          const msg: unknown = JSON.parse(event.data);
+          if (isRecord(msg) && typeof msg.type === 'string') {
+            handleMessage(msg as { type: string; payload?: unknown });
+          }
         } catch {
           // ignore malformed messages
         }
@@ -84,6 +90,7 @@ export function useWebSocket() {
               const prev = useStore.getState().agents.find((a) => a.id === p!.id);
               if (prev?.visualState === 'WORKING') {
                 addLogEntry({ level: 'info', message: `${p.name ?? prev.name ?? p.id} finished work` });
+                clearAgentThinking(p.id as string);
               }
             }
           }
@@ -110,13 +117,13 @@ export function useWebSocket() {
             const status = p.status as string | undefined;
 
             updateTask(p.id as string, {
-              ...(p.title && { title: p.title as string }),
-              ...(p.status && { status: p.status as string }),
-              ...(p.assigneeAgentId !== undefined && { assigneeAgentId: p.assigneeAgentId as string }),
-              ...(p.description !== undefined && { description: p.description as string }),
-              ...(p.result !== undefined && { result: p.result as string }),
-              ...(p.error !== undefined && { error: p.error as string }),
-              ...(p.parentTaskId !== undefined && { parentTaskId: p.parentTaskId as string }),
+              ...(p.title ? { title: p.title as string } : {}),
+              ...(p.status ? { status: p.status as string } : {}),
+              ...(p.assigneeAgentId !== undefined ? { assigneeAgentId: p.assigneeAgentId as string } : {}),
+              ...(p.description !== undefined ? { description: p.description as string } : {}),
+              ...(p.result !== undefined ? { result: p.result as string } : {}),
+              ...(p.error !== undefined ? { error: p.error as string } : {}),
+              ...(p.parentTaskId !== undefined ? { parentTaskId: p.parentTaskId as string } : {}),
             } as never);
 
             // Log task status changes
@@ -152,13 +159,28 @@ export function useWebSocket() {
           if (typeof p?.hour === 'number') setCurrentHour(p.hour as number);
           break;
         case 'chat:message':
-          if (p?.content) {
+          if (p?.content && typeof p.content === 'string') {
             addChatMessage({
               role: (p.role as 'user' | 'assistant') ?? 'assistant',
-              content: p.content as string,
+              content: (p.content as string).slice(0, 50_000),
               sender: p.sender as string | undefined,
               timestamp: (p.timestamp as string) ?? new Date().toISOString(),
             });
+          }
+          break;
+        case 'orchestration:complete':
+          window.dispatchEvent(new CustomEvent('mct:event', { detail: { type: 'orchestration_complete' } }));
+          addLogEntry({ level: 'success', message: '오케스트레이션 완료' });
+          break;
+        case 'orchestration:error':
+          if (typeof p?.error === 'string') {
+            addLogEntry({ level: 'error', message: p.error });
+            window.dispatchEvent(new CustomEvent('mct:event', { detail: { type: 'orchestration_error', error: p.error } }));
+          }
+          break;
+        case 'agent:thinking':
+          if (p?.agentId && typeof p.agentId === 'string' && typeof p.chunk === 'string') {
+            appendAgentThinking(p.agentId, p.chunk.slice(0, 10_000));
           }
           break;
         case 'agent:deleted':
@@ -181,7 +203,7 @@ export function useWebSocket() {
           break;
       }
     },
-    [setAgents, updateAgent, removeAgent, setTasks, updateTask, setCurrentHour, addChatMessage, addLogEntry],
+    [setAgents, updateAgent, removeAgent, setTasks, updateTask, setCurrentHour, addChatMessage, addLogEntry, appendAgentThinking, clearAgentThinking],
   );
 
   const send = useCallback((type: string, payload?: unknown) => {
