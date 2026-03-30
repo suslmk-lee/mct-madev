@@ -324,5 +324,79 @@ export function createTasksRouter(): Router {
     }
   });
 
+  // POST /tasks/:id/webhook-complete — called by external WEBHOOK agents to report completion
+  router.post('/tasks/:id/webhook-complete', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const id = param(req, 'id');
+
+      const task = await db.getTask(id);
+      if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+      if (!['IN_PROGRESS', 'CREATED'].includes(task.status)) {
+        res.status(400).json({ error: `Task is not IN_PROGRESS (current: ${task.status})` });
+        return;
+      }
+
+      const { result, error } = req.body ?? {};
+      const isError = !!error;
+      const updated = await db.updateTask(id, {
+        status: isError ? ('FAILED' as TaskStatus) : ('DONE' as TaskStatus),
+        result: typeof result === 'string' ? result : undefined,
+        error: typeof error === 'string' ? error : undefined,
+      });
+
+      if (wss) {
+        wss.broadcastToProject(updated.projectId, {
+          type: 'task:update' as never,
+          timestamp: new Date().toISOString(),
+          payload: updated,
+        });
+      }
+
+      res.json({ data: updated });
+    } catch (err) {
+      sendError(res, 500, 'Failed to complete task via webhook', err);
+    }
+  });
+
+  // POST /tasks/:id/approve — human approves a task that has requiresApproval=true
+  router.post('/tasks/:id/approve', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const id = param(req, 'id');
+
+      const task = await db.getTask(id);
+      if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+      if (!task.requiresApproval) {
+        res.status(400).json({ error: 'Task does not require approval' });
+        return;
+      }
+      if (task.approvedAt) {
+        res.status(409).json({ error: 'Task already approved' });
+        return;
+      }
+
+      const updated = await db.updateTask(id, {
+        approvedAt: new Date().toISOString(),
+        // Advance from APPROVED → IN_PROGRESS if currently APPROVED
+        ...(task.status === 'APPROVED' ? { status: 'IN_PROGRESS' as TaskStatus } : {}),
+      });
+
+      if (wss) {
+        wss.broadcastToProject(updated.projectId, {
+          type: 'task:update' as never,
+          timestamp: new Date().toISOString(),
+          payload: updated,
+        });
+      }
+
+      res.json({ data: updated });
+    } catch (err) {
+      sendError(res, 500, 'Failed to approve task', err);
+    }
+  });
+
   return router;
 }

@@ -42,6 +42,22 @@ export interface Agent {
   visualState: AgentVisualState;
   position: { x: number; y: number; z: number };
   currentTaskId?: string;
+  /** Maximum input+output tokens per calendar month. undefined = unlimited. */
+  monthlyBudgetTokens?: number;
+  /** node-cron expression for scheduled heartbeat execution, e.g. "0 * * * *" (every hour). undefined = no schedule. */
+  heartbeatCron?: string;
+  /** ID of the agent this agent reports to (manager). undefined = top of the org chart. */
+  managerId?: string;
+  /** Human-readable job title, e.g. "Senior Developer", "QA Lead". */
+  title?: string;
+  /** Governance approval state. PENDING = awaiting board approval before activation. */
+  approvalStatus?: 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'TERMINATED';
+  /** ISO timestamp when the agent was approved. */
+  approvedAt?: string;
+  /** Agent runtime type. LLM = internal gateway call (default). WEBHOOK = POST task to external URL. */
+  agentType?: 'LLM' | 'WEBHOOK';
+  /** For WEBHOOK agents: the URL to POST task assignments to. */
+  webhookUrl?: string;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;

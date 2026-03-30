@@ -14,3 +14,5 @@ export {
   createWorkflowsRouter,
   createMetricsRouter,
 } from './routes/index.js';
+export { HeartbeatScheduler } from './scheduler.js';
+export type { HeartbeatCallback } from './scheduler.js';

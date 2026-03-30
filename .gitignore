@@ -3,16 +3,18 @@ dist/
 .env
 .env.local
 *.db
+*.db.tmp
 *.sqlite
 .next/
 .turbo/
 coverage/
 *.tsbuildinfo
+*.log
 plan-raw.md
 
 .claude
 .madev
 .mct-madev
 .env
-CALUDE.md
+CLAUDE.md
 

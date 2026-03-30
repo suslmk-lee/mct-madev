@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS projects (
   description TEXT,
   repo_path TEXT,
   status TEXT NOT NULL DEFAULT 'ACTIVE',
+  goals TEXT,
   config TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -37,6 +38,14 @@ CREATE TABLE IF NOT EXISTS agents (
   visual_state TEXT NOT NULL DEFAULT 'IDLE',
   position TEXT NOT NULL DEFAULT '{"x":0,"y":0,"z":0}',
   current_task_id TEXT,
+  monthly_budget_tokens INTEGER,
+  heartbeat_cron TEXT,
+  manager_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  title TEXT,
+  approval_status TEXT NOT NULL DEFAULT 'APPROVED',
+  approved_at TEXT,
+  agent_type TEXT NOT NULL DEFAULT 'LLM',
+  webhook_url TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -68,6 +77,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   metadata TEXT NOT NULL DEFAULT '{}',
   result TEXT,
   error TEXT,
+  requires_approval INTEGER NOT NULL DEFAULT 0,
+  approved_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -135,6 +146,7 @@ interface ProjectRow {
   description: string | null;
   repo_path: string | null;
   status: string;
+  goals: string | null;
   config: string;
   created_at: string;
   updated_at: string;
@@ -151,6 +163,14 @@ interface AgentRow {
   visual_state: string;
   position: string;
   current_task_id: string | null;
+  monthly_budget_tokens: number | null;
+  heartbeat_cron: string | null;
+  manager_id: string | null;
+  title: string | null;
+  approval_status: string;
+  approved_at: string | null;
+  agent_type: string;
+  webhook_url: string | null;
   metadata: string;
   created_at: string;
   updated_at: string;
@@ -170,6 +190,8 @@ interface TaskRow {
   metadata: string;
   result: string | null;
   error: string | null;
+  requires_approval: number;
+  approved_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -239,6 +261,7 @@ function rowToProject(row: ProjectRow): Project {
     name: row.name,
     description: row.description ?? undefined,
     repoPath: row.repo_path ?? undefined,
+    goals: row.goals ? safeJsonParse(row.goals, undefined) : undefined,
     config: safeJsonParse(row.config, {} as any),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -258,6 +281,14 @@ function rowToAgent(row: AgentRow): Agent {
     visualState: row.visual_state as Agent['visualState'],
     position: safeJsonParse(row.position, { x: 0, y: 0, z: 0 }),
     currentTaskId: row.current_task_id ?? undefined,
+    monthlyBudgetTokens: row.monthly_budget_tokens ?? undefined,
+    heartbeatCron: row.heartbeat_cron ?? undefined,
+    managerId: row.manager_id ?? undefined,
+    title: row.title ?? undefined,
+    approvalStatus: (row.approval_status ?? 'APPROVED') as Agent['approvalStatus'],
+    approvedAt: row.approved_at ?? undefined,
+    agentType: (row.agent_type ?? 'LLM') as Agent['agentType'],
+    webhookUrl: row.webhook_url ?? undefined,
     metadata: safeJsonParse(row.metadata, {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -279,6 +310,8 @@ function rowToTask(row: TaskRow): Task {
     metadata: safeJsonParse(row.metadata, {}),
     result: row.result ?? undefined,
     error: row.error ?? undefined,
+    requiresApproval: row.requires_approval === 1 ? true : undefined,
+    approvedAt: row.approved_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -368,6 +401,71 @@ export class SqliteDatabase implements IDatabase {
       this.save();
     }
 
+    // Migrate: add goals column to projects if missing (added in v0.3)
+    try {
+      this.db.run('SELECT goals FROM projects LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE projects ADD COLUMN goals TEXT');
+      this.save();
+    }
+
+    // Migrate: add monthly_budget_tokens to agents if missing (added in v0.3)
+    try {
+      this.db.run('SELECT monthly_budget_tokens FROM agents LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE agents ADD COLUMN monthly_budget_tokens INTEGER');
+      this.save();
+    }
+
+    // Migrate: add agent_type and webhook_url to agents if missing (added in v0.3)
+    try {
+      this.db.run('SELECT agent_type FROM agents LIMIT 1');
+    } catch {
+      this.db.run("ALTER TABLE agents ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'LLM'");
+      this.db.run('ALTER TABLE agents ADD COLUMN webhook_url TEXT');
+      this.save();
+    }
+
+    // Migrate: add approval_status and approved_at to agents if missing (added in v0.3)
+    try {
+      this.db.run('SELECT approval_status FROM agents LIMIT 1');
+    } catch {
+      this.db.run("ALTER TABLE agents ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'APPROVED'");
+      this.db.run('ALTER TABLE agents ADD COLUMN approved_at TEXT');
+      this.save();
+    }
+
+    // Migrate: add requires_approval and approved_at to tasks if missing (added in v0.3)
+    try {
+      this.db.run('SELECT requires_approval FROM tasks LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE tasks ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0');
+      this.db.run('ALTER TABLE tasks ADD COLUMN approved_at TEXT');
+      this.save();
+    }
+
+    // Migrate: add manager_id and title to agents if missing (added in v0.3)
+    try {
+      this.db.run('SELECT manager_id FROM agents LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE agents ADD COLUMN manager_id TEXT');
+      this.save();
+    }
+    try {
+      this.db.run('SELECT title FROM agents LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE agents ADD COLUMN title TEXT');
+      this.save();
+    }
+
+    // Migrate: add heartbeat_cron to agents if missing (added in v0.3)
+    try {
+      this.db.run('SELECT heartbeat_cron FROM agents LIMIT 1');
+    } catch {
+      this.db.run('ALTER TABLE agents ADD COLUMN heartbeat_cron TEXT');
+      this.save();
+    }
+
     // Migrate: create tool_calls table if missing (added in v0.2)
     try {
       this.db.run('SELECT id FROM tool_calls LIMIT 1');
@@ -411,9 +509,9 @@ export class SqliteDatabase implements IDatabase {
     const id = crypto.randomUUID();
     const ts = now();
     this.db.run(
-      `INSERT INTO projects (id, name, description, repo_path, status, config, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, project.name, project.description ?? null, project.repoPath ?? null, (project as any).status ?? 'ACTIVE', JSON.stringify(project.config), ts, ts],
+      `INSERT INTO projects (id, name, description, repo_path, status, goals, config, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, project.name, project.description ?? null, project.repoPath ?? null, (project as any).status ?? 'ACTIVE', project.goals ? JSON.stringify(project.goals) : null, JSON.stringify(project.config), ts, ts],
     );
     this.save();
     return (await this.getProject(id))!;
@@ -439,6 +537,7 @@ export class SqliteDatabase implements IDatabase {
     if (updates.name !== undefined) { sets.push('name = ?'); values.push(updates.name); }
     if (updates.description !== undefined) { sets.push('description = ?'); values.push(updates.description); }
     if (updates.repoPath !== undefined) { sets.push('repo_path = ?'); values.push(updates.repoPath); }
+    if (updates.goals !== undefined) { sets.push('goals = ?'); values.push(updates.goals ? JSON.stringify(updates.goals) : null); }
     if (updates.config !== undefined) { sets.push('config = ?'); values.push(JSON.stringify(updates.config)); }
     if ((updates as any).status !== undefined) { sets.push('status = ?'); values.push((updates as any).status); }
 
@@ -459,9 +558,9 @@ export class SqliteDatabase implements IDatabase {
     const id = crypto.randomUUID();
     const ts = now();
     this.db.run(
-      `INSERT INTO agents (id, project_id, name, role, provider, model, system_prompt, visual_state, position, current_task_id, metadata, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, agent.projectId, agent.name, agent.role, agent.provider, agent.model, agent.systemPrompt ?? null, agent.visualState, JSON.stringify(agent.position), agent.currentTaskId ?? null, JSON.stringify(agent.metadata), ts, ts],
+      `INSERT INTO agents (id, project_id, name, role, provider, model, system_prompt, visual_state, position, current_task_id, monthly_budget_tokens, heartbeat_cron, manager_id, title, approval_status, approved_at, agent_type, webhook_url, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, agent.projectId, agent.name, agent.role, agent.provider, agent.model, agent.systemPrompt ?? null, agent.visualState, JSON.stringify(agent.position), agent.currentTaskId ?? null, agent.monthlyBudgetTokens ?? null, agent.heartbeatCron ?? null, agent.managerId ?? null, agent.title ?? null, agent.approvalStatus ?? 'APPROVED', agent.approvedAt ?? null, agent.agentType ?? 'LLM', agent.webhookUrl ?? null, JSON.stringify(agent.metadata), ts, ts],
     );
     this.save();
     return (await this.getAgent(id))!;
@@ -492,6 +591,14 @@ export class SqliteDatabase implements IDatabase {
     if (updates.visualState !== undefined) { sets.push('visual_state = ?'); values.push(updates.visualState); }
     if (updates.position !== undefined) { sets.push('position = ?'); values.push(JSON.stringify(updates.position)); }
     if (updates.currentTaskId !== undefined) { sets.push('current_task_id = ?'); values.push(updates.currentTaskId); }
+    if (updates.monthlyBudgetTokens !== undefined) { sets.push('monthly_budget_tokens = ?'); values.push(updates.monthlyBudgetTokens ?? null); }
+    if (updates.heartbeatCron !== undefined) { sets.push('heartbeat_cron = ?'); values.push(updates.heartbeatCron ?? null); }
+    if (updates.managerId !== undefined) { sets.push('manager_id = ?'); values.push(updates.managerId ?? null); }
+    if (updates.title !== undefined) { sets.push('title = ?'); values.push(updates.title ?? null); }
+    if (updates.approvalStatus !== undefined) { sets.push('approval_status = ?'); values.push(updates.approvalStatus ?? 'APPROVED'); }
+    if (updates.approvedAt !== undefined) { sets.push('approved_at = ?'); values.push(updates.approvedAt ?? null); }
+    if (updates.agentType !== undefined) { sets.push('agent_type = ?'); values.push(updates.agentType ?? 'LLM'); }
+    if (updates.webhookUrl !== undefined) { sets.push('webhook_url = ?'); values.push(updates.webhookUrl ?? null); }
     if (updates.metadata !== undefined) { sets.push('metadata = ?'); values.push(JSON.stringify(updates.metadata)); }
 
     values.push(id);
@@ -515,9 +622,9 @@ export class SqliteDatabase implements IDatabase {
     const id = crypto.randomUUID();
     const ts = now();
     this.db.run(
-      `INSERT INTO tasks (id, project_id, workflow_id, parent_task_id, title, description, status, assignee_agent_id, priority, dependencies, metadata, result, error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, task.projectId, task.workflowId ?? null, task.parentTaskId ?? null, task.title, task.description, task.status, task.assigneeAgentId ?? null, task.priority, JSON.stringify(task.dependencies), JSON.stringify(task.metadata), task.result ?? null, task.error ?? null, ts, ts],
+      `INSERT INTO tasks (id, project_id, workflow_id, parent_task_id, title, description, status, assignee_agent_id, priority, dependencies, metadata, result, error, requires_approval, approved_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, task.projectId, task.workflowId ?? null, task.parentTaskId ?? null, task.title, task.description, task.status, task.assigneeAgentId ?? null, task.priority, JSON.stringify(task.dependencies), JSON.stringify(task.metadata), task.result ?? null, task.error ?? null, task.requiresApproval ? 1 : 0, task.approvedAt ?? null, ts, ts],
     );
     this.save();
     return (await this.getTask(id))!;
@@ -572,6 +679,8 @@ export class SqliteDatabase implements IDatabase {
     if (updates.error !== undefined) { sets.push('error = ?'); values.push(updates.error); }
     if (updates.workflowId !== undefined) { sets.push('workflow_id = ?'); values.push(updates.workflowId); }
     if (updates.parentTaskId !== undefined) { sets.push('parent_task_id = ?'); values.push(updates.parentTaskId); }
+    if (updates.requiresApproval !== undefined) { sets.push('requires_approval = ?'); values.push(updates.requiresApproval ? 1 : 0); }
+    if (updates.approvedAt !== undefined) { sets.push('approved_at = ?'); values.push(updates.approvedAt ?? null); }
 
     values.push(id);
     this.db.run(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`, values as (string | number | null)[]);
@@ -703,6 +812,18 @@ export class SqliteDatabase implements IDatabase {
     }
 
     return summary;
+  }
+
+  async getAgentMonthlyTokens(agentId: string): Promise<number> {
+    // First day of current UTC calendar month
+    const d = new Date();
+    const monthStart = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-01T00:00:00.000Z`;
+    const row = stmtGetOne<{ total: number }>(
+      this.db,
+      'SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total FROM token_usage WHERE agent_id = ? AND created_at >= ?',
+      [agentId, monthStart],
+    );
+    return row?.total ?? 0;
   }
 
   // ── Tool call logging ──────────────────────────────────────────────────

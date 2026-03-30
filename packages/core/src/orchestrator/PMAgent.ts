@@ -1,5 +1,6 @@
 import type { Task } from '../types/task.js';
 import type { ChatMessage, ChatResponse } from '../types/model.js';
+import type { ProjectGoals } from '../types/project.js';
 import { TaskStatus } from '../types/task.js';
 
 export type ChatFn = (messages: ChatMessage[]) => Promise<ChatResponse>;
@@ -44,6 +45,7 @@ export class PMAgent {
     task: Task,
     chatFn: ChatFn,
     agents?: Array<{ name: string; role: string; id: string }>,
+    goals?: ProjectGoals,
   ): Promise<SubtaskDef[]> {
     const agentInfo = agents && agents.length > 0
       ? `\n\nAvailable team members:\n${agents
@@ -102,13 +104,23 @@ IMPORTANT RULES:
 Respond ONLY with the JSON array, no markdown fences, no explanation.`,
     };
 
+    const goalsContext = goals
+      ? [
+          goals.mission ? `Company Mission: ${goals.mission}` : '',
+          goals.strategy ? `Current Strategy: ${goals.strategy}` : '',
+          goals.okrs && goals.okrs.length > 0
+            ? `Key Results:\n${goals.okrs.map((o) => `  - ${o}`).join('\n')}`
+            : '',
+        ].filter(Boolean).join('\n')
+      : '';
+
     const userMessage: ChatMessage = {
       role: 'user',
       content: `Break down this task into subtasks:
 
 Title: ${task.title}
 Description: ${task.description}
-${task.metadata ? `Context: ${JSON.stringify(task.metadata)}` : ''}`,
+${task.metadata ? `Context: ${JSON.stringify(task.metadata)}` : ''}${goalsContext ? `\n\nProject Goals (context for subtask design):\n${goalsContext}` : ''}`,
     };
 
     const response = await chatFn([systemMessage, userMessage]);

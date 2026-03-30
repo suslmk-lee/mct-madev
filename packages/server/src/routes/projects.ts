@@ -316,5 +316,114 @@ export function createProjectsRouter(): Router {
     }
   });
 
+  // GET /projects/:id/export — export project + agents as portable template JSON
+  router.get('/:id/export', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const id = param(req, 'id');
+      const project = await db.getProject(id);
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+
+      const agents = await db.listAgents(id);
+      const { id: _pid, createdAt: _pc, updatedAt: _pu, ...projectData } = project;
+
+      // Scrub API-key-like values from agent metadata
+      const scrub = (val: unknown): unknown => {
+        if (typeof val === 'string' && /^(sk-|key-|api[-_]?key|token)/i.test(val)) return '[REDACTED]';
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          return Object.fromEntries(Object.entries(val as Record<string, unknown>).map(([k, v]) => [k, scrub(v)]));
+        }
+        return val;
+      };
+
+      const agentTemplates = agents.map((a) => {
+        const { id: _aid, projectId: _apid, currentTaskId: _ctid, createdAt: _ac, updatedAt: _au, visualState: _vs, position: _pos, ...agentData } = a;
+        return { ...agentData, metadata: scrub(agentData.metadata) as Record<string, unknown> };
+      });
+
+      const template = {
+        version: '1' as const,
+        exportedAt: new Date().toISOString(),
+        project: projectData,
+        agents: agentTemplates,
+      };
+
+      res.setHeader('Content-Disposition', `attachment; filename="project-${id}.json"`);
+      res.json(template);
+    } catch (err) {
+      sendError(res, 500, 'Failed to export project', err);
+    }
+  });
+
+  // POST /projects/import — import a project template and create new project + agents
+  router.post('/import', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const template = req.body as { version?: string; project?: Record<string, unknown>; agents?: unknown[] };
+
+      if (!template || template.version !== '1' || !template.project) {
+        res.status(400).json({ error: 'Invalid template format. Expected { version: "1", project: {...}, agents: [...] }' });
+        return;
+      }
+
+      const { name, description, config, goals, repoPath } = template.project as Record<string, unknown>;
+      if (!name || typeof name !== 'string') {
+        res.status(400).json({ error: 'Template project.name is required' });
+        return;
+      }
+      if (!config || typeof config !== 'object') {
+        res.status(400).json({ error: 'Template project.config is required' });
+        return;
+      }
+
+      // Auto-generate new repo path to avoid collision
+      let effectiveRepoPath: string | undefined;
+      if (repoPath && typeof repoPath === 'string') {
+        const { join } = await import('node:path');
+        const { homedir } = await import('node:os');
+        effectiveRepoPath = join(homedir(), 'mct-madev-projects', slugify(name) + '-' + Date.now());
+        const { mkdirSync } = await import('node:fs');
+        mkdirSync(effectiveRepoPath, { recursive: true });
+      }
+
+      const project = await db.createProject({
+        name: `${name} (imported)`,
+        description: typeof description === 'string' ? description : undefined,
+        repoPath: effectiveRepoPath,
+        goals: goals as any,
+        config: config as any,
+      });
+
+      const { AgentVisualState, assignPosition } = await import('@mct-madev/core');
+      const createdAgents = [];
+      const agentList = Array.isArray(template.agents) ? template.agents : [];
+      for (const agentTemplate of agentList) {
+        const a = agentTemplate as Record<string, unknown>;
+        if (!a.name || !a.role || !a.provider || !a.model) continue;
+        const position = assignPosition(a.role as string, createdAgents);
+        const agent = await db.createAgent({
+          projectId: project.id,
+          name: a.name as string,
+          role: a.role as any,
+          provider: a.provider as string,
+          model: a.model as string,
+          systemPrompt: typeof a.systemPrompt === 'string' ? a.systemPrompt : undefined,
+          visualState: AgentVisualState.IDLE,
+          position,
+          monthlyBudgetTokens: typeof a.monthlyBudgetTokens === 'number' ? a.monthlyBudgetTokens : undefined,
+          heartbeatCron: typeof a.heartbeatCron === 'string' ? a.heartbeatCron : undefined,
+          managerId: undefined, // re-link manually after import
+          title: typeof a.title === 'string' ? a.title : undefined,
+          metadata: (a.metadata && typeof a.metadata === 'object') ? a.metadata as Record<string, unknown> : {},
+        });
+        createdAgents.push(agent);
+      }
+
+      res.status(201).json({ data: { project, agents: createdAgents } });
+    } catch (err) {
+      sendError(res, 500, 'Failed to import project', err);
+    }
+  });
+
   return router;
 }

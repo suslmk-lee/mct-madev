@@ -13,6 +13,7 @@ export interface ServerDatabase {
     name: string;
     description?: string;
     repoPath?: string;
+    goals?: Project['goals'];
     config: Project['config'];
   }): Promise<Project>;
   getProject(id: string): Promise<Project | null>;
@@ -47,6 +48,9 @@ export interface ServerDatabase {
   getWorkflow(id: string): Promise<Workflow | null>;
   listWorkflows(projectId: string): Promise<Workflow[]>;
   updateWorkflow(id: string, data: Partial<Omit<Workflow, 'id' | 'projectId' | 'createdAt'>>): Promise<Workflow>;
+
+  // Budget tracking (optional)
+  getAgentMonthlyTokens?(agentId: string): Promise<number>;
 
   // Metrics (optional)
   getTokenUsage?(projectId: string): Promise<{

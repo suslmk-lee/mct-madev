@@ -786,6 +786,7 @@ async function executeSubtasks(
   pmAgent?: Agent,
   chatHistory?: Array<{ role: string; content: string; sender?: string; timestamp: string }>,
   repoPath?: string,
+  projectGoals?: import('@mct-madev/core').ProjectGoals,
 ): Promise<void> {
   const allSkills = skillLoader?.loadSkills() ?? [];
   const currentAgents = [...agents];
@@ -813,6 +814,38 @@ async function executeSubtasks(
       await db.updateTask(subtask.id, { assigneeAgentId: agent.id });
     }
 
+    // ── Governance check — SUSPENDED/TERMINATED agents cannot execute ──
+    if (agent.approvalStatus === 'SUSPENDED' || agent.approvalStatus === 'TERMINATED') {
+      const blocked = await db.updateTask(subtask.id, {
+        status: TaskStatus.BLOCKED,
+        error: `에이전트 ${agent.name}이(가) ${agent.approvalStatus} 상태로 태스크를 실행할 수 없습니다.`,
+      });
+      broadcastTaskUpdate(wss, projectId, blocked);
+      broadcastChatStatus(wss, projectId, `⛔ **${agent.name}** ${agent.approvalStatus} — 태스크 차단됨`, pmName, chatHistory);
+      failedCount++;
+      return;
+    }
+
+    // ── Budget check ──────────────────────────────────────────────────
+    if (agent.monthlyBudgetTokens && db.getAgentMonthlyTokens) {
+      const usedThisMonth = await db.getAgentMonthlyTokens(agent.id);
+      if (usedThisMonth >= agent.monthlyBudgetTokens) {
+        logger.warn({ agentId: agent.id, usedThisMonth, budget: agent.monthlyBudgetTokens }, 'Agent monthly budget exceeded — blocking task');
+        const blocked = await db.updateTask(subtask.id, {
+          status: TaskStatus.BLOCKED,
+          error: `에이전트 ${agent.name}의 월별 토큰 예산 초과 (${usedThisMonth.toLocaleString()}/${agent.monthlyBudgetTokens.toLocaleString()} tokens)`,
+        });
+        broadcastTaskUpdate(wss, projectId, blocked);
+        broadcastChatStatus(
+          wss, projectId,
+          `⛔ **${agent.name}** 월별 토큰 예산 초과 (${usedThisMonth.toLocaleString()}/${agent.monthlyBudgetTokens.toLocaleString()}) — **${subtask.title}** 중단`,
+          pmName, chatHistory,
+        );
+        failedCount++;
+        return;
+      }
+    }
+
     broadcastChatStatus(
       wss, projectId,
       `▶ **${subtask.title}** 시작 → ${agent.name}`,
@@ -826,6 +859,38 @@ async function executeSubtasks(
       const inProgress = await db.updateTask(subtask.id, { status: TaskStatus.IN_PROGRESS });
       broadcastTaskUpdate(wss, projectId, inProgress);
 
+      // ── WEBHOOK agent: delegate to external HTTP endpoint ──────────
+      if (agent.agentType === 'WEBHOOK') {
+        if (!agent.webhookUrl) {
+          throw new Error(`WEBHOOK agent ${agent.name} has no webhookUrl configured`);
+        }
+        const payload = {
+          taskId: subtask.id,
+          title: subtask.title,
+          description: subtask.description,
+          projectId,
+          callbackUrl: `/api/tasks/${subtask.id}/webhook-complete`,
+        };
+        broadcastChatStatus(wss, projectId, `🌐 **${subtask.title}** → ${agent.name} (webhook: ${agent.webhookUrl})`, pmName, chatHistory);
+        const webhookRes = await fetch(agent.webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(30_000),
+        });
+        const webhookBody = await webhookRes.text().catch(() => '');
+        if (!webhookRes.ok) {
+          throw new Error(`Webhook returned HTTP ${webhookRes.status}: ${webhookBody.slice(0, 200)}`);
+        }
+        const done = await db.updateTask(subtask.id, { status: TaskStatus.DONE, result: webhookBody || '(webhook accepted)' });
+        broadcastTaskUpdate(wss, projectId, done);
+        const agentIdle = await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE });
+        broadcastAgentUpdate(wss, projectId, agentIdle);
+        broadcastChatStatus(wss, projectId, `✅ **${subtask.title}** 완료 (webhook)`, pmName, chatHistory);
+        doneCount++;
+        return;
+      }
+
       const selectedSkills = skillLoader
         ? skillLoader.selectSkills(allSkills, agent.role, subtask.description)
         : [];
@@ -835,9 +900,19 @@ async function executeSubtasks(
 
       const rolePrompt = ROLE_PROMPTS[agent.role] ?? ROLE_PROMPTS.DEVELOPER;
       const toolInstruction = 'IMPORTANT: Use the write_file tool to create ALL files. Do not output code in text.';
+      const goalsBlock = projectGoals
+        ? [
+            '\n\n## Project Goals (why this work matters)',
+            projectGoals.mission ? `Mission: ${projectGoals.mission}` : '',
+            projectGoals.strategy ? `Strategy: ${projectGoals.strategy}` : '',
+            projectGoals.okrs?.length
+              ? `Key Results:\n${projectGoals.okrs.map((o) => `- ${o}`).join('\n')}`
+              : '',
+          ].filter(Boolean).join('\n')
+        : '';
       const effectiveSystemPrompt = agent.systemPrompt
-        ? `${rolePrompt}\n\n${agent.systemPrompt}\n\n${toolInstruction}`
-        : `${rolePrompt}\n\n${toolInstruction}`;
+        ? `${rolePrompt}\n\n${agent.systemPrompt}${goalsBlock}\n\n${toolInstruction}`
+        : `${rolePrompt}${goalsBlock}\n\n${toolInstruction}`;
 
       // ── Agentic tool execution loop ─────────────────────────────
       // Each "round" = one LLM call + all resulting tool executions
@@ -1406,6 +1481,7 @@ export function createChatRouter(): Router {
             rootTask as never,
             pmChatFn,
             agents.map((a) => ({ name: a.name, role: a.role, id: a.id })),
+            (await db.getProject(projectId))?.goals,
           );
         } catch (err) {
           await db.updateTask(rootTask.id, { status: TaskStatus.DONE, result: `Decompose failed: ${err}` });
@@ -1470,7 +1546,7 @@ export function createChatRouter(): Router {
         const skillLoader = getSkillLoader(req);
         const project = await db.getProject(projectId);
         const repoPath = project?.repoPath;
-        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, repoPath)
+        executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, repoPath, project?.goals)
           .catch((err) => {
             logger.error({ err: String(err), projectId }, 'Orchestration execution failed');
             if (wss) {
@@ -1584,7 +1660,7 @@ export function createChatRouter(): Router {
 
       let subtaskDefs;
       try {
-        subtaskDefs = await pm.decompose(rootTask as never, pmChatFn, agents.map((a) => ({ name: a.name, role: a.role, id: a.id })));
+        subtaskDefs = await pm.decompose(rootTask as never, pmChatFn, agents.map((a) => ({ name: a.name, role: a.role, id: a.id })), (await db.getProject(projectId))?.goals);
       } catch (err) {
         runningOrchestrations.delete(projectId);
         await db.updateTask(rootTask.id, { status: TaskStatus.DONE, result: `Decompose failed: ${err}` });
@@ -1615,7 +1691,7 @@ export function createChatRouter(): Router {
 
       const skillLoader = getSkillLoader(req);
       const project = await db.getProject(projectId);
-      executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, project?.repoPath)
+      executeSubtasks(db, wss, projectId, chatFn, agents, createdSubtasks, skillLoader, pmAgent, history, project?.repoPath, project?.goals)
         .catch((err) => {
           logger.error({ err: String(err), projectId }, 'Retry orchestration failed');
           if (wss) wss.broadcastToProject(projectId, { type: 'orchestration:error' as never, timestamp: new Date().toISOString(), payload: { projectId, error: 'Retry failed. Check server logs.' } });

@@ -42,6 +42,10 @@ export interface Task {
   metadata: Record<string, unknown>;
   result?: string;
   error?: string;
+  /** When true, the task will pause at APPROVED state and wait for a human to call POST /tasks/:id/approve before proceeding. */
+  requiresApproval?: boolean;
+  /** ISO timestamp when a human approved this task to proceed. */
+  approvedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

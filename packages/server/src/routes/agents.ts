@@ -42,11 +42,36 @@ export function createAgentsRouter(): Router {
     }
   });
 
+  // GET /projects/:projectId/orgchart — returns hierarchical org tree
+  router.get('/projects/:projectId/orgchart', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const agents = await db.listAgents(param(req, 'projectId'));
+
+      type OrgNode = typeof agents[number] & { reports: OrgNode[] };
+      const nodeMap = new Map<string, OrgNode>();
+      for (const a of agents) nodeMap.set(a.id, { ...a, reports: [] });
+
+      const roots: OrgNode[] = [];
+      for (const node of nodeMap.values()) {
+        if (node.managerId && nodeMap.has(node.managerId)) {
+          nodeMap.get(node.managerId)!.reports.push(node);
+        } else {
+          roots.push(node);
+        }
+      }
+
+      res.json({ data: roots });
+    } catch (err) {
+      sendError(res, 500, 'Failed to build org chart', err);
+    }
+  });
+
   // POST /projects/:projectId/agents
   router.post('/projects/:projectId/agents', async (req: Request, res: Response) => {
     try {
       const db = getDb(req);
-      const { name, role, provider, model, systemPrompt, position, metadata } = req.body;
+      const { name, role, provider, model, systemPrompt, position, monthlyBudgetTokens, heartbeatCron, metadata } = req.body;
 
       if (!name || typeof name !== 'string') {
         res.status(400).json({ error: 'name is required and must be a string' });
@@ -81,6 +106,17 @@ export function createAgentsRouter(): Router {
         res.status(400).json({ error: `systemPrompt exceeds max length (${SYSTEM_PROMPT_MAX_LENGTH})` });
         return;
       }
+      if (monthlyBudgetTokens !== undefined && (typeof monthlyBudgetTokens !== 'number' || monthlyBudgetTokens <= 0)) {
+        res.status(400).json({ error: 'monthlyBudgetTokens must be a positive number' });
+        return;
+      }
+      if (heartbeatCron !== undefined && heartbeatCron !== null) {
+        const { default: cronLib } = await import('node-cron');
+        if (!cronLib.validate(heartbeatCron)) {
+          res.status(400).json({ error: 'heartbeatCron is not a valid cron expression (e.g. "0 * * * *")' });
+          return;
+        }
+      }
 
       const projectId = param(req, 'projectId');
 
@@ -103,6 +139,8 @@ export function createAgentsRouter(): Router {
         systemPrompt: effectiveSystemPrompt,
         visualState: AgentVisualState.IDLE,
         position: agentPosition,
+        monthlyBudgetTokens: typeof monthlyBudgetTokens === 'number' ? monthlyBudgetTokens : undefined,
+        heartbeatCron: typeof heartbeatCron === 'string' ? heartbeatCron : undefined,
         metadata: metadata ?? {},
       });
       res.status(201).json({ data: agent });
@@ -139,7 +177,24 @@ export function createAgentsRouter(): Router {
         return;
       }
 
-      const updated = await db.updateAgent(id, req.body);
+      const { monthlyBudgetTokens: budgetUpdate, heartbeatCron: cronUpdate, ...otherUpdates } = req.body;
+      if (cronUpdate !== undefined && cronUpdate !== null) {
+        const { default: cronLib } = await import('node-cron');
+        if (!cronLib.validate(cronUpdate)) {
+          res.status(400).json({ error: 'heartbeatCron is not a valid cron expression' });
+          return;
+        }
+      }
+      if (budgetUpdate !== undefined && (typeof budgetUpdate !== 'number' || budgetUpdate <= 0) && budgetUpdate !== null) {
+        res.status(400).json({ error: 'monthlyBudgetTokens must be a positive number or null to remove' });
+        return;
+      }
+      const updatePayload = {
+        ...otherUpdates,
+        ...(budgetUpdate !== undefined ? { monthlyBudgetTokens: budgetUpdate ?? undefined } : {}),
+        ...(cronUpdate !== undefined ? { heartbeatCron: cronUpdate ?? undefined } : {}),
+      };
+      const updated = await db.updateAgent(id, updatePayload);
 
       // Broadcast visual state change if it changed
       if (req.body.visualState && req.body.visualState !== existing.visualState && wss) {
@@ -160,6 +215,51 @@ export function createAgentsRouter(): Router {
     } catch (err) {
       sendError(res, 500, 'Failed to update agent', err);
     }
+  });
+
+  // POST /agents/:id/approve — approve a PENDING agent
+  router.post('/agents/:id/approve', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const id = param(req, 'id');
+      const existing = await db.getAgent(id);
+      if (!existing) { res.status(404).json({ error: 'Agent not found' }); return; }
+      const updated = await db.updateAgent(id, { approvalStatus: 'APPROVED', approvedAt: new Date().toISOString() });
+      if (wss) wss.broadcastToProject(updated.projectId, { type: 'agent:update' as never, timestamp: new Date().toISOString(), payload: updated });
+      logger.info({ agentId: id }, 'Agent approved');
+      res.json({ data: updated });
+    } catch (err) { sendError(res, 500, 'Failed to approve agent', err); }
+  });
+
+  // POST /agents/:id/suspend — suspend an active agent
+  router.post('/agents/:id/suspend', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const id = param(req, 'id');
+      const existing = await db.getAgent(id);
+      if (!existing) { res.status(404).json({ error: 'Agent not found' }); return; }
+      const updated = await db.updateAgent(id, { approvalStatus: 'SUSPENDED' });
+      if (wss) wss.broadcastToProject(updated.projectId, { type: 'agent:update' as never, timestamp: new Date().toISOString(), payload: updated });
+      logger.info({ agentId: id }, 'Agent suspended');
+      res.json({ data: updated });
+    } catch (err) { sendError(res, 500, 'Failed to suspend agent', err); }
+  });
+
+  // POST /agents/:id/terminate — permanently terminate an agent
+  router.post('/agents/:id/terminate', async (req: Request, res: Response) => {
+    try {
+      const db = getDb(req);
+      const wss = getWss(req);
+      const id = param(req, 'id');
+      const existing = await db.getAgent(id);
+      if (!existing) { res.status(404).json({ error: 'Agent not found' }); return; }
+      const updated = await db.updateAgent(id, { approvalStatus: 'TERMINATED' });
+      if (wss) wss.broadcastToProject(updated.projectId, { type: 'agent:update' as never, timestamp: new Date().toISOString(), payload: updated });
+      logger.warn({ agentId: id }, 'Agent terminated');
+      res.json({ data: updated });
+    } catch (err) { sendError(res, 500, 'Failed to terminate agent', err); }
   });
 
   // DELETE /agents/:id

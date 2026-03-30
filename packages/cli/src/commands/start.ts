@@ -14,7 +14,7 @@ import {
   OllamaProvider,
 } from '@mct-madev/gateway';
 import { Orchestrator, SkillLoader, type GatewayChatFn } from '@mct-madev/core';
-import { createServer, createEventBridge, setupSubscribeSync } from '@mct-madev/server';
+import { createServer, createEventBridge, setupSubscribeSync, HeartbeatScheduler } from '@mct-madev/server';
 
 interface StartOptions {
   port: string;
@@ -182,6 +182,58 @@ export async function startCommand(options: StartOptions) {
     setupSubscribeSync(instance.wss, db);
     console.log(chalk.dim('  ✓ Event bridge connected'));
 
+    // 8a. Start heartbeat scheduler — wakes agents on their cron schedule
+    const scheduler = new HeartbeatScheduler(db, async (agent) => {
+      // Find CREATED or BLOCKED tasks assigned to this agent
+      const [createdTasks, blockedTasks] = await Promise.all([
+        db.listTasks(agent.projectId, { status: 'CREATED' as any, assigneeAgentId: agent.id }),
+        db.listTasks(agent.projectId, { status: 'BLOCKED' as any, assigneeAgentId: agent.id }),
+      ]);
+      const pendingTasks = [...createdTasks, ...blockedTasks];
+      if (pendingTasks.length === 0) return;
+
+      console.log(chalk.dim(`  ♥ ${agent.name} heartbeat: ${pendingTasks.length} task(s) to process`));
+
+      // Trigger via the chat route's internal orchestration by sending an internal directive
+      // Use the chatFn directly to process each task
+      const agents = await db.listAgents(agent.projectId);
+      const project = await db.getProject(agent.projectId);
+      const { TaskStatus, AgentVisualState } = await import('@mct-madev/core');
+      for (const task of pendingTasks) {
+        try {
+          const agentUpdated = await db.updateAgent(agent.id, { visualState: AgentVisualState.WORKING });
+          instance.wss.broadcastToProject(agent.projectId, {
+            type: 'agent:update' as never,
+            timestamp: new Date().toISOString(),
+            payload: agentUpdated,
+          });
+          const inProgress = await db.updateTask(task.id, { status: TaskStatus.IN_PROGRESS });
+          instance.wss.broadcastToProject(agent.projectId, {
+            type: 'task:update' as never,
+            timestamp: new Date().toISOString(),
+            payload: inProgress,
+          });
+
+          const response = await chatFn(
+            agent.provider,
+            agent.model,
+            [{ role: 'user', content: task.description || task.title }],
+            agent.systemPrompt,
+          );
+
+          const done = await db.updateTask(task.id, { status: TaskStatus.DONE, result: response.content });
+          const agentIdle = await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE });
+          instance.wss.broadcastToProject(agent.projectId, { type: 'task:update' as never, timestamp: new Date().toISOString(), payload: done });
+          instance.wss.broadcastToProject(agent.projectId, { type: 'agent:update' as never, timestamp: new Date().toISOString(), payload: agentIdle });
+        } catch (err) {
+          await db.updateTask(task.id, { status: TaskStatus.FAILED, error: String(err) }).catch(() => {});
+          await db.updateAgent(agent.id, { visualState: AgentVisualState.IDLE }).catch(() => {});
+        }
+      }
+    });
+    await scheduler.start();
+    console.log(chalk.dim('  ✓ Heartbeat scheduler started'));
+
     // 9. Start listening
     const { port: actualPort } = await instance.listen(port);
     const url = `http://localhost:${actualPort}`;
@@ -209,6 +261,7 @@ export async function startCommand(options: StartOptions) {
       shuttingDown = true;
       console.log(chalk.yellow('\nShutting down...'));
       try {
+        scheduler.stop();
         await instance.close();
         await db.close();
         console.log(chalk.green('Server stopped.'));

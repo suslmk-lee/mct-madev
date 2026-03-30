@@ -1,5 +1,15 @@
 export type ProjectStatus = 'ACTIVE' | 'SUSPENDED' | 'CLOSED';
 
+/** Goal hierarchy for a project — informs agents of the "why" behind every task */
+export interface ProjectGoals {
+  /** Top-level mission statement, e.g. "Build the #1 AI note-taking app to $1M MRR" */
+  mission?: string;
+  /** Current strategy or focus area */
+  strategy?: string;
+  /** Key results / OKRs — short bullet strings */
+  okrs?: string[];
+}
+
 export type TeamPreset = 'fullstack' | 'frontend' | 'backend' | 'minimal';
 
 export interface TeamRoleDef {
@@ -37,6 +47,7 @@ export interface Project {
   name: string;
   description?: string;
   repoPath?: string;
+  goals?: ProjectGoals;
   config: ProjectConfig;
   createdAt: string;
   updatedAt: string;

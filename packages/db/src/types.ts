@@ -51,6 +51,8 @@ export interface IDatabase {
   // Token usage
   recordTokenUsage(usage: TokenUsageInput): Promise<void>;
   getTokenUsage(projectId: string): Promise<TokenUsageSummary>;
+  /** Sum of input+output tokens for an agent in the current calendar month (UTC). */
+  getAgentMonthlyTokens(agentId: string): Promise<number>;
 
   // Tool call logging
   logToolCall(entry: ToolCallInput): Promise<ToolCallEntry>;
